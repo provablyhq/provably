@@ -1,6 +1,6 @@
 {
   "name": "provably",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "Flags the lines an AI wrote in a pull request that no test executes, using provenance recorded when Claude Code writes them.",
   "license": "Apache-2.0",
