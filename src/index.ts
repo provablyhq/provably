@@ -1,0 +1,165 @@
+export { tokenize, type Token } from "./tokenize.js";
+export { alignTokens, type AlignedPair } from "./lcs.js";
+export {
+  type CharRange,
+  type LedgerEvent,
+  hashContent,
+  parseLedger,
+  serializeEvent,
+  labelsFromRanges,
+  effectiveAiRanges,
+} from "./ledger.js";
+export {
+  propagateLabels,
+  type LabeledToken,
+  type PropagationResult,
+  type PropagationOptions,
+  type AnchorStrength,
+} from "./propagate.js";
+export { rollupByLine, type LineProvenance } from "./lines.js";
+export {
+  git,
+  fileContentAtRev,
+  commitsTouchingFile,
+  blameLineOrigins,
+  commitTimesTouchingFile,
+  mergeBase,
+  resolveCommit,
+  addedLinesBetween,
+  parseAddedLines,
+  type LineOrigin,
+  type CommitTime,
+} from "./git.js";
+export {
+  anchoredAiLinesForFile,
+  commitAnchorsForFile,
+  keepOnlyVerbatimAiLines,
+  vetoLines,
+  resolveFileProvenanceFromHistory,
+  type HistoryProvenance,
+  type CommitAnchor,
+  type ResolveOptions,
+} from "./resolve.js";
+export {
+  discoverAnchors,
+  gradeLedgerFile,
+  gradeLedger,
+  loadLedger,
+  survivalRecall,
+  type Anchor,
+  type SurvivalTotals,
+  type LedgerFileResult,
+  type LedgerGradeResult,
+} from "./grade-ledger.js";
+export {
+  aiRangesForWrite,
+  aiRangesForEdit,
+  aiRangesForMultiEdit,
+  aiRangesForToolCall,
+  normalizeRanges,
+  buildEvent,
+  type EditOperation,
+  type ToolCall,
+} from "./capture.js";
+export {
+  reverseEdits,
+  mapRangesThroughReplacement,
+  propagateRanges,
+  chainFileAiRanges,
+  buildChainedEvent,
+  type CaptureSnapshot,
+  type Replacement,
+  type ChainMethod,
+  type ChainResult,
+} from "./chain.js";
+export {
+  isHistoryCommand,
+  diffLines,
+  aiRangesForBashChange,
+  buildBashEvents,
+  type LineHunk,
+  type BashFileChange,
+} from "./bash-capture.js";
+export { snapshotWorktree, changedFilesBetween, fileInTree, type ChangedFile } from "./worktree-snapshot.js";
+export { readSnapshot, writeSnapshot, snapshotReaderForRepo } from "./snapshot-store.js";
+export {
+  parseCoverage,
+  parseLcov,
+  parseCobertura,
+  parseCoveragePyJson,
+  detectCoverageFormat,
+  mergeCoverageReports,
+  alignCoverageToRepo,
+  coverageForFile,
+  type CoverageReport,
+  type CoverageFormat,
+  type LineHits,
+} from "./coverage.js";
+export {
+  assessPathRisk,
+  areaForModule,
+  parseImports,
+  sourceLanguage,
+  fileRiskContext,
+  callEvidenceForLines,
+  fileRisk,
+  findingRisk,
+  parseRiskConfig,
+  matchesGlob,
+  isLogicLine,
+  fileRole,
+  pathWords,
+  EMPTY_RISK_CONFIG,
+  RISK_CONFIG_FILE,
+  STANDARD_RISK,
+  type RiskTier,
+  type RiskEvidence,
+  type RiskEvidenceSource,
+  type RiskAssessment,
+  type RiskConfig,
+  type FileRiskContext,
+  type ImportBinding,
+  type RiskyBinding,
+  type LineText,
+  type SourceLanguage,
+  type FileRole,
+} from "./risk.js";
+export {
+  analyzePullRequest,
+  checkRunPayload,
+  riskConfigAt,
+  CHECK_NAME,
+  type PullRequestCheckInput,
+  type PullRequestCheckResult,
+  type UncoveredAiFinding,
+  type FileCheckSummary,
+  type FileCoverageStatus,
+  type CheckAnnotation,
+  type CheckRunPayload,
+} from "./pr-check.js";
+export { typeOnlyLines, isTypeScriptFile } from "./type-only.js";
+export {
+  syncLedger,
+  fetchLedgers,
+  loadProvenance,
+  commitLocalLedger,
+  parseLedgerLenient,
+  cloneId,
+  ledgerRefFor,
+  LEDGER_REF_PREFIX,
+  LEDGER_FETCH_REFSPEC,
+  type ProvenanceSource,
+  type SyncResult,
+  type SyncStatus,
+  type LedgerCommit,
+} from "./ledger-sync.js";
+export {
+  installClaudeHooks,
+  installPrePushHook,
+  ensureGitignored,
+  removeClaudeHooks,
+  removeHookBlock,
+  prePushHookPath,
+  CAPTURE_COMMAND,
+} from "./init.js";
+export { workflowAnnotationCommands, stepSummaryMarkdown } from "./github-output.js";

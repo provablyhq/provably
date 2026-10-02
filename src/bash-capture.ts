@@ -1,0 +1,219 @@
+import { alignTokens } from "./lcs.js";
+import { tokenize } from "./tokenize.js";
+import { commonPrefixLength, commonSuffixLength, normalizeRanges, buildEvent } from "./capture.js";
+import { chainFileAiRanges, type CaptureSnapshot, type ChainMethod } from "./chain.js";
+import type { CharRange, LedgerEvent } from "./ledger.js";
+
+const STRONG_LINE_MIN_TOKENS = 3;
+const MIN_FRAGMENT_LENGTH = 3;
+const MAX_CAPTURE_FILE_LENGTH = 200_000;
+
+const HISTORY_SUBCOMMANDS =
+  "pull|merge|rebase|checkout|switch|reset|cherry-pick|stash|revert|am|apply|restore|clone|submodule|subtree|worktree";
+const HISTORY_COMMAND = new RegExp(
+  `\\bgit\\b(?:\\s+(?:-C|-c)\\s+\\S+|\\s+--?[\\w-]+(?:=\\S+)?)*\\s+(?:${HISTORY_SUBCOMMANDS})\\b|\\bgh\\s+pr\\s+checkout\\b`,
+);
+
+export function isHistoryCommand(command: string): boolean {
+  return HISTORY_COMMAND.test(command);
+}
+
+interface Line {
+  readonly text: string;
+  readonly start: number;
+  readonly end: number;
+}
+
+export interface LineHunk {
+  readonly removed: number[];
+  readonly added: number[];
+}
+
+function splitLines(content: string): Line[] {
+  const lines: Line[] = [];
+  let start = 0;
+  for (const text of content.split("\n")) {
+    lines.push({ text, start, end: start + text.length });
+    start += text.length + 1;
+  }
+  return lines;
+}
+
+export function diffLines(beforeTexts: readonly string[], afterTexts: readonly string[]): LineHunk[] {
+  let prefix = 0;
+  while (prefix < beforeTexts.length && prefix < afterTexts.length && beforeTexts[prefix] === afterTexts[prefix]) {
+    prefix++;
+  }
+  let suffix = 0;
+  while (
+    suffix < beforeTexts.length - prefix &&
+    suffix < afterTexts.length - prefix &&
+    beforeTexts[beforeTexts.length - 1 - suffix] === afterTexts[afterTexts.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+
+  const beforeMiddle = beforeTexts.slice(prefix, beforeTexts.length - suffix);
+  const afterMiddle = afterTexts.slice(prefix, afterTexts.length - suffix);
+  const pairs = alignTokens(beforeMiddle, afterMiddle);
+
+  const hunks: LineHunk[] = [];
+  let beforeCursor = 0;
+  let afterCursor = 0;
+  const boundaries = [...pairs, { oldIndex: beforeMiddle.length, newIndex: afterMiddle.length }];
+  for (const boundary of boundaries) {
+    const removed: number[] = [];
+    const added: number[] = [];
+    for (let index = beforeCursor; index < boundary.oldIndex; index++) removed.push(prefix + index);
+    for (let index = afterCursor; index < boundary.newIndex; index++) added.push(prefix + index);
+    if (removed.length > 0 || added.length > 0) hunks.push({ removed, added });
+    beforeCursor = boundary.oldIndex + 1;
+    afterCursor = boundary.newIndex + 1;
+  }
+  return slideHunksDown(hunks, beforeTexts, afterTexts);
+}
+
+function slideHunksDown(
+  hunks: readonly LineHunk[],
+  beforeTexts: readonly string[],
+  afterTexts: readonly string[],
+): LineHunk[] {
+  const slid = hunks.map((hunk) => ({ removed: [...hunk.removed], added: [...hunk.added] }));
+  for (let hunkIndex = 0; hunkIndex < slid.length; hunkIndex++) {
+    const hunk = slid[hunkIndex]!;
+    const next = slid[hunkIndex + 1];
+    const side = hunk.removed.length === 0 ? hunk.added : hunk.added.length === 0 ? hunk.removed : null;
+    if (side === null || side.length === 0) continue;
+    const texts = side === hunk.added ? afterTexts : beforeTexts;
+    const nextStart = next === undefined ? Infinity : (side === hunk.added ? next.added[0] : next.removed[0]) ?? Infinity;
+    while (true) {
+      const first = side[0]!;
+      const following = side[side.length - 1]! + 1;
+      if (following >= texts.length || following >= nextStart || texts[first] !== texts[following]) break;
+      side.shift();
+      side.push(following);
+    }
+  }
+  return slid;
+}
+
+type LineClass = "blank" | "moved" | "absent" | "weak" | "strong";
+
+export function aiRangesForBashChange(before: string, after: string, command: string): CharRange[] {
+  const beforeLines = splitLines(before);
+  const afterLines = splitLines(after);
+  const hunks = diffLines(
+    beforeLines.map((line) => line.text),
+    afterLines.map((line) => line.text),
+  );
+
+  const removedCounts = new Map<string, number>();
+  for (const hunk of hunks) {
+    for (const index of hunk.removed) {
+      const trimmed = beforeLines[index]!.text.trim();
+      if (trimmed !== "") removedCounts.set(trimmed, (removedCounts.get(trimmed) ?? 0) + 1);
+    }
+  }
+
+  const ranges: CharRange[] = [];
+  for (const hunk of hunks) {
+    const classes = hunk.added.map((index): LineClass => {
+      const trimmed = afterLines[index]!.text.trim();
+      if (trimmed === "") return "blank";
+      const removedCount = removedCounts.get(trimmed) ?? 0;
+      if (removedCount > 0) {
+        removedCounts.set(trimmed, removedCount - 1);
+        return "moved";
+      }
+      if (!command.includes(trimmed)) return "absent";
+      return tokenize(trimmed).length >= STRONG_LINE_MIN_TOKENS ? "strong" : "weak";
+    });
+
+    const isAi = classes.map((lineClass) => lineClass === "strong");
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let position = 0; position < classes.length; position++) {
+        if (classes[position] !== "weak" || isAi[position]) continue;
+        if (nearestNonBlankIsAi(classes, isAi, position, -1) || nearestNonBlankIsAi(classes, isAi, position, 1)) {
+          isAi[position] = true;
+          changed = true;
+        }
+      }
+    }
+
+    const paired = hunk.removed.length === hunk.added.length;
+    hunk.added.forEach((lineIndex, position) => {
+      const line = afterLines[lineIndex]!;
+      if (!paired) {
+        if (isAi[position]) ranges.push([line.start, line.end]);
+        return;
+      }
+      if (!isAi[position] && classes[position] !== "absent") return;
+      const beforeText = beforeLines[hunk.removed[position]!]!.text;
+      const prefix = commonPrefixLength(beforeText, line.text);
+      const suffix = commonSuffixLength(beforeText, line.text, prefix);
+      const fragment = line.text.slice(prefix, line.text.length - suffix).trim();
+      const fragmentIsAuthored =
+        isAi[position] || (fragment.length >= MIN_FRAGMENT_LENGTH && command.includes(fragment));
+      if (fragment !== "" && fragmentIsAuthored) ranges.push([line.start + prefix, line.end - suffix]);
+    });
+  }
+  return normalizeRanges(ranges);
+}
+
+function nearestNonBlankIsAi(
+  classes: readonly LineClass[],
+  isAi: readonly boolean[],
+  position: number,
+  direction: 1 | -1,
+): boolean {
+  for (let cursor = position + direction; cursor >= 0 && cursor < classes.length; cursor += direction) {
+    if (classes[cursor] === "blank") continue;
+    return isAi[cursor]!;
+  }
+  return false;
+}
+
+export interface BashFileChange {
+  readonly path: string;
+  readonly before: string;
+  readonly after: string;
+}
+
+export function buildBashEvents(params: {
+  readonly command: string;
+  readonly changes: readonly BashFileChange[];
+  readonly tool: string;
+  readonly model: string | null;
+  readonly previousFor: (file: string) => CaptureSnapshot | null;
+  readonly identity?: () => { id: string; ts: string };
+}): { event: LedgerEvent; method: ChainMethod; content: string }[] {
+  if (isHistoryCommand(params.command)) return [];
+  const captured: { event: LedgerEvent; method: ChainMethod; content: string }[] = [];
+  for (const change of params.changes) {
+    if (change.after.length > MAX_CAPTURE_FILE_LENGTH || change.before.length > MAX_CAPTURE_FILE_LENGTH) continue;
+    if (change.after.includes("\0") || change.before.includes("\0")) continue;
+
+    const deltaRanges = aiRangesForBashChange(change.before, change.after, params.command);
+    const chain = chainFileAiRanges({
+      call: { toolName: "Bash", toolInput: { command: params.command } },
+      content: change.after,
+      deltaRanges,
+      previous: params.previousFor(change.path),
+    });
+    if (chain.fileAiRanges.length === 0) continue;
+
+    const event = buildEvent({
+      tool: params.tool,
+      model: params.model,
+      file: change.path,
+      content: change.after,
+      aiRanges: deltaRanges,
+      fileAiRanges: chain.fileAiRanges,
+      ...(params.identity === undefined ? {} : params.identity()),
+    });
+    captured.push({ event, method: chain.method, content: change.after });
+  }
+  return captured;
+}

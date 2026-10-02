@@ -1,0 +1,50 @@
+import { historyScenarios } from "./history-scenarios.js";
+import { gradeAllHistory } from "./grade-history.js";
+import { aiLinePrecision, aiLineRecall, falseFlagRate, type GradeTotals } from "./grader.js";
+
+const GATE_MAX_FALSE_FLAG_RATE = 0.01;
+const GATE_MIN_AI_LINE_PRECISION = 0.9;
+const NAME_WIDTH = 48;
+
+function percent(value: number): string {
+  return `${(value * 100).toFixed(1)}%`.padStart(7);
+}
+
+function cells(totals: GradeTotals): string {
+  return [percent(aiLinePrecision(totals)), percent(aiLineRecall(totals)), percent(falseFlagRate(totals))].join(" ");
+}
+
+const { results, deltaOnly, chained, reanchored } = gradeAllHistory(historyScenarios);
+
+console.log("Grader: git topology stress test (simulated repo, ground truth by construction)");
+console.log("Columns per ledger: ai-line precision, ai-line recall, false-flag rate on pure-human lines");
+console.log("");
+const header = `${"scenario".padEnd(NAME_WIDTH)}  ${"delta-only ledger".padEnd(23)}  ${"chained ledger".padEnd(23)}  ${"chained + re-anchor".padEnd(23)}`;
+console.log(header);
+console.log("-".repeat(header.length));
+for (const result of results) {
+  const label = result.ambiguity === null ? result.name : `${result.name} [ambiguous]`;
+  console.log(
+    `${label.padEnd(NAME_WIDTH)}  ${cells(result.deltaOnly)}  ${cells(result.chained)}  ${cells(result.reanchored)}`,
+  );
+}
+console.log("-".repeat(header.length));
+console.log(`${"OVERALL".padEnd(NAME_WIDTH)}  ${cells(deltaOnly)}  ${cells(chained)}  ${cells(reanchored)}`);
+console.log("");
+for (const result of results) {
+  if (result.ambiguity !== null) console.log(`[ambiguous] ${result.name}: ${result.ambiguity}`);
+}
+console.log("");
+
+const falseFlag = falseFlagRate(reanchored);
+const precision = aiLinePrecision(reanchored);
+const falseFlagPass = falseFlag <= GATE_MAX_FALSE_FLAG_RATE;
+const precisionPass = precision >= GATE_MIN_AI_LINE_PRECISION;
+
+console.log("Phase 0 gate (chained ledger with re-anchoring, the shipping configuration)");
+console.log(`  false-flag rate on human code  ${percent(falseFlag)}  (target <= ${percent(GATE_MAX_FALSE_FLAG_RATE)})  ${falseFlagPass ? "PASS" : "FAIL"}`);
+console.log(`  precision on AI lines          ${percent(precision)}  (target >= ${percent(GATE_MIN_AI_LINE_PRECISION)})  ${precisionPass ? "PASS" : "FAIL"}`);
+console.log("");
+console.log(falseFlagPass && precisionPass ? "GATE: PASS" : "GATE: FAIL");
+
+process.exit(falseFlagPass && precisionPass ? 0 : 1);
