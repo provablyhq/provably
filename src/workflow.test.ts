@@ -228,3 +228,100 @@ test("GitHub Actions output escapes workflow commands", () => {
   ]);
   assert.match(stepSummaryMarkdown(payload), /\| `src\/a,b\.ts:3-4` \| high \|/);
 });
+
+function captureWrite(cwd: string, binDirectory: string, absoluteFilePath: string, content: string, sessionId: string): void {
+  mkdirSync(dirname(absoluteFilePath), { recursive: true });
+  writeFileSync(absoluteFilePath, content);
+  const payload = {
+    hook_event_name: "PostToolUse",
+    tool_name: "Write",
+    cwd,
+    session_id: sessionId,
+    tool_input: { file_path: absoluteFilePath, content },
+    tool_response: { success: true },
+  };
+  run(cwd, binDirectory, "provably", ["capture"], JSON.stringify(payload));
+}
+
+function sharedLedgerFiles(remote: string): string {
+  const ref = git(remote, ["for-each-ref", "--format=%(refname)", LEDGER_REF_PREFIX]).trim();
+  return git(remote, ["cat-file", "blob", `${ref}:ledger.jsonl`]);
+}
+
+function setUpDeveloperClone(workspace: string, binDirectory: string): { remote: string; developer: string } {
+  const remote = join(workspace, "remote.git");
+  git(workspace, ["init", "-q", "--bare", "-b", "main", remote]);
+  const developer = join(workspace, "developer");
+  run(workspace, binDirectory, "git", ["clone", "-q", remote, developer]);
+  writeFileSync(join(developer, "README.md"), "app\n");
+  run(developer, binDirectory, "git", ["add", "."]);
+  run(developer, binDirectory, "git", ["commit", "-q", "-m", "init"]);
+  run(developer, binDirectory, "git", ["push", "-q", "origin", "main"]);
+  run(developer, binDirectory, "provably", ["init"]);
+  run(developer, binDirectory, "git", ["add", "."]);
+  run(developer, binDirectory, "git", ["commit", "-q", "-m", "provably init"]);
+  run(developer, binDirectory, "git", ["push", "-q", "origin", "main"]);
+  return { remote, developer };
+}
+
+test("a git worktree shares one ledger with its main checkout", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "provably-worktree-"));
+  try {
+    const binDirectory = makeShim(workspace);
+    const { remote, developer } = setUpDeveloperClone(workspace, binDirectory);
+
+    run(developer, binDirectory, "git", ["checkout", "-q", "-b", "feature-main"]);
+    captureWrite(developer, binDirectory, join(developer, "src", "alpha.js"), "export function alpha(value) {\n  return value + 1;\n}\n", "session-main");
+    run(developer, binDirectory, "git", ["add", "-A"]);
+    run(developer, binDirectory, "git", ["commit", "-q", "-m", "alpha"]);
+    run(developer, binDirectory, "git", ["push", "-q", "origin", "feature-main"]);
+
+    const worktree = join(workspace, "worktree");
+    run(developer, binDirectory, "git", ["worktree", "add", "-q", "-b", "feature-worktree", worktree, "main"]);
+    const betaContent = "export function beta(value) {\n  if (value < 0) {\n    throw new Error('negative');\n  }\n  return value * 2;\n}\n";
+    captureWrite(worktree, binDirectory, join(worktree, "src", "beta.js"), betaContent, "session-worktree");
+    assert.equal(existsSync(join(worktree, ".ai-provenance")), false, "the worktree writes into the main checkout's ledger");
+    assert.match(readFileSync(join(developer, ".ai-provenance", "ledger.jsonl"), "utf8"), /src\/beta\.js/);
+
+    run(worktree, binDirectory, "git", ["add", "-A"]);
+    run(worktree, binDirectory, "git", ["commit", "-q", "-m", "beta"]);
+    run(worktree, binDirectory, "git", ["push", "-q", "origin", "feature-worktree"]);
+    const shared = sharedLedgerFiles(remote);
+    assert.match(shared, /src\/beta\.js/, "the push from the worktree shared its own records");
+    assert.match(shared, /src\/alpha\.js/, "and kept the records pushed earlier from the main checkout");
+
+    const throwLine = betaContent.split("\n").findIndex((line) => line.includes("throw")) + 1;
+    const lcovPath = join(workspace, "lcov.info");
+    writeFileSync(lcovPath, `SF:src/beta.js\nDA:1,1\nDA:2,1\nDA:${throwLine},0\nDA:5,1\nend_of_record\n`);
+    const checkOutput = run(worktree, binDirectory, "provably", ["check", "--base", "main", "--coverage", lcovPath]);
+    assert.match(checkOutput, new RegExp(`src/beta\\.js:${throwLine} `), "a check run inside the worktree sees the records");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("pushing from another branch never drops records shared earlier", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "provably-branches-"));
+  try {
+    const binDirectory = makeShim(workspace);
+    const { remote, developer } = setUpDeveloperClone(workspace, binDirectory);
+
+    run(developer, binDirectory, "git", ["checkout", "-q", "-b", "feature-a"]);
+    captureWrite(developer, binDirectory, join(developer, "src", "only-on-a.js"), "export const onlyOnA = 1;\n", "session-a");
+    run(developer, binDirectory, "git", ["add", "-A"]);
+    run(developer, binDirectory, "git", ["commit", "-q", "-m", "a"]);
+    run(developer, binDirectory, "git", ["push", "-q", "origin", "feature-a"]);
+
+    run(developer, binDirectory, "git", ["checkout", "-q", "-b", "feature-b", "main"]);
+    captureWrite(developer, binDirectory, join(developer, "src", "only-on-b.js"), "export const onlyOnB = 2;\n", "session-b");
+    run(developer, binDirectory, "git", ["add", "-A"]);
+    run(developer, binDirectory, "git", ["commit", "-q", "-m", "b"]);
+    run(developer, binDirectory, "git", ["push", "-q", "origin", "feature-b"]);
+
+    const shared = sharedLedgerFiles(remote);
+    assert.match(shared, /src\/only-on-b\.js/);
+    assert.match(shared, /src\/only-on-a\.js/, "the record for a file that only exists on feature-a survives the push from feature-b");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});

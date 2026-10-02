@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { git } from "./git.js";
 import { HOOK_BLOCK_START, hasCaptureHook, prePushHookPath } from "./init.js";
 import { LEDGER_FILE, ledgerRefFor, loadProvenance } from "./ledger-sync.js";
-import { LEDGER_DIRECTORY } from "./snapshot-store.js";
+import { ledgerDirectoryFor } from "./snapshot-store.js";
 
 function claudeHooksInstalled(repoRoot: string): boolean {
   for (const file of ["settings.json", "settings.local.json"]) {
@@ -39,7 +39,7 @@ export function runStatus(argv: readonly string[]): number {
   const claudeHooks = claudeHooksInstalled(repoRoot);
   const hookPath = prePushHookPath(repoRoot);
   const prePush = existsSync(hookPath) && readFileSync(hookPath, "utf8").includes(HOOK_BLOCK_START);
-  const localLedgerPath = join(repoRoot, LEDGER_DIRECTORY, LEDGER_FILE);
+  const localLedgerPath = join(ledgerDirectoryFor(repoRoot), LEDGER_FILE);
   const provenance = loadProvenance(repoRoot);
   const lastEvent = [...provenance.events].sort((left, right) => Date.parse(right.ts) - Date.parse(left.ts))[0];
   let sharedCommit: string | null = null;

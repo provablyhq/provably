@@ -5,7 +5,7 @@ import { parseLedger, hashContent, labelsFromRanges, effectiveAiRanges, type Led
 import { tokenize } from "./tokenize.js";
 import { rollupByLine, type LineProvenance } from "./lines.js";
 import { resolveFileProvenanceFromHistory } from "./resolve.js";
-import { snapshotReaderForRepo } from "./snapshot-store.js";
+import { ledgerDirectoryFor, snapshotReaderForRepo } from "./snapshot-store.js";
 import { isMainModule } from "./entry.js";
 
 function repoRoot(startDir: string): string {
@@ -70,7 +70,7 @@ export function runReport(argv: readonly string[]): number {
   const absolute = isAbsolute(target) ? target : resolve(process.cwd(), target);
   const root = repoRoot(dirname(absolute));
   const file = relative(root, absolute);
-  const ledgerPath = join(root, ".ai-provenance", "ledger.jsonl");
+  const ledgerPath = join(ledgerDirectoryFor(root), "ledger.jsonl");
 
   let events: LedgerEvent[];
   try {

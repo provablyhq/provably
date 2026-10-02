@@ -2,7 +2,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync }
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { git } from "./git.js";
 import { cloneId } from "./ledger-sync.js";
-import { LEDGER_DIRECTORY } from "./snapshot-store.js";
+import { LEDGER_DIRECTORY, ledgerDirectoryFor } from "./snapshot-store.js";
 
 export const CAPTURE_COMMAND = "command -v provably >/dev/null 2>&1 && provably capture || true";
 export const HOOK_BLOCK_START = "# >>> provably >>>";
@@ -199,7 +199,7 @@ export function runUninstall(argv: readonly string[]): number {
   lines.push(
     "",
     "Recorded data was kept. To delete it too:",
-    `  rm -rf ${LEDGER_DIRECTORY}`,
+    `  rm -rf ${ledgerDirectoryFor(repoRoot)}`,
     `  git push origin --delete refs/provably/ledgers/${cloneId(repoRoot)}`,
   );
   process.stdout.write(`${lines.join("\n")}\n`);

@@ -18,7 +18,7 @@ import { buildChainedEvent, type CaptureSnapshot } from "./chain.js";
 import type { ToolCall } from "./capture.js";
 import { buildBashEvents, type BashFileChange } from "./bash-capture.js";
 import { snapshotWorktree, changedFilesBetween, fileInTree } from "./worktree-snapshot.js";
-import { LEDGER_DIRECTORY, readSnapshot, writeSnapshot } from "./snapshot-store.js";
+import { LEDGER_DIRECTORY, ledgerDirectoryFor, readSnapshot, writeSnapshot } from "./snapshot-store.js";
 import { isMainModule } from "./entry.js";
 
 const LEDGER_FILE = "ledger.jsonl";
@@ -137,7 +137,7 @@ function handleFileTool(payload: Record<string, unknown>): void {
 
   const content = readFileSync(absoluteFilePath, "utf8");
   const call: ToolCall = { toolName: toolName(payload), toolInput };
-  const ledgerDirectory = join(root, LEDGER_DIRECTORY);
+  const ledgerDirectory = ledgerDirectoryFor(root);
   const captured = buildChainedEvent({
     call,
     content,
@@ -183,7 +183,7 @@ function handleBashBefore(payload: Record<string, unknown>): void {
   if (command === "") return;
   const root = gitRootFor(payloadCwd(payload));
   if (root === null) return;
-  const pendingDirectory = join(root, LEDGER_DIRECTORY, PENDING_DIRECTORY);
+  const pendingDirectory = join(ledgerDirectoryFor(root), PENDING_DIRECTORY);
   mkdirSync(pendingDirectory, { recursive: true });
   prunePending(pendingDirectory);
   const tree = snapshotWorktree(root);
@@ -195,7 +195,7 @@ function handleBashAfter(payload: Record<string, unknown>): void {
   if (command === "") return;
   const root = gitRootFor(payloadCwd(payload));
   if (root === null) return;
-  const ledgerDirectory = join(root, LEDGER_DIRECTORY);
+  const ledgerDirectory = ledgerDirectoryFor(root);
   const pendingPath = join(ledgerDirectory, PENDING_DIRECTORY, pendingKey(payload, command));
   if (!existsSync(pendingPath)) return;
   const beforeTree = readFileSync(pendingPath, "utf8").trim();

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { git, gitWithInput } from "./git.js";
 import { hashContent, parseLedger, serializeEvent, type LedgerEvent } from "./ledger.js";
-import { LEDGER_DIRECTORY, SNAPSHOT_DIRECTORY, readSnapshot } from "./snapshot-store.js";
+import { SNAPSHOT_DIRECTORY, ledgerDirectoryFor, readSnapshot } from "./snapshot-store.js";
 
 export const LEDGER_FILE = "ledger.jsonl";
 export const LEDGER_REF_PREFIX = "refs/provably/ledgers/";
@@ -80,33 +80,78 @@ export interface LedgerCommit {
   readonly skippedEventCount: number;
 }
 
+function sharedEventsIn(repoDir: string, commit: string | null): LedgerEvent[] {
+  if (commit === null) return [];
+  try {
+    return parseLedgerLenient(git(repoDir, ["cat-file", "blob", `${commit}:${LEDGER_FILE}`]));
+  } catch {
+    return [];
+  }
+}
+
+function sharedSnapshotBlobsIn(repoDir: string, commit: string | null): Map<string, string> {
+  const blobByHash = new Map<string, string>();
+  if (commit === null) return blobByHash;
+  let listing: string;
+  try {
+    listing = git(repoDir, ["ls-tree", "-z", `${commit}:${SNAPSHOT_DIRECTORY}`]);
+  } catch {
+    return blobByHash;
+  }
+  for (const entry of listing.split("\0")) {
+    const match = /^\d+ blob ([0-9a-f]+)\t(.+)$/.exec(entry);
+    if (match !== null) blobByHash.set(match[2]!, match[1]!);
+  }
+  return blobByHash;
+}
+
+function compareEvents(left: LedgerEvent, right: LedgerEvent): number {
+  if (left.ts !== right.ts) return left.ts < right.ts ? -1 : 1;
+  return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+}
+
 export function commitLocalLedger(repoDir: string): LedgerCommit | null {
-  const ledgerDirectory = join(repoDir, LEDGER_DIRECTORY);
+  const ledgerDirectory = ledgerDirectoryFor(repoDir);
   const ledgerPath = join(ledgerDirectory, LEDGER_FILE);
   if (!existsSync(ledgerPath)) return null;
   const allEvents = parseLedgerLenient(readFileSync(ledgerPath, "utf8"));
   const shareable = shareableFiles(repoDir);
-  const events = allEvents.filter((event) => shareable.has(event.file));
+  const newlyShareable = allEvents.filter((event) => shareable.has(event.file));
+
+  const ref = ledgerRefFor(repoDir);
+  const existingCommit = revParse(repoDir, ref);
+  const eventsById = new Map<string, LedgerEvent>();
+  for (const event of sharedEventsIn(repoDir, existingCommit)) eventsById.set(event.id, event);
+  for (const event of newlyShareable) eventsById.set(event.id, event);
+  const events = [...eventsById.values()].sort(compareEvents);
   if (events.length === 0) return null;
 
-  const snapshotHashes = [...new Set(events.map((event) => event.contentSha256))].filter((contentSha256) =>
-    existsSync(join(ledgerDirectory, SNAPSHOT_DIRECTORY, contentSha256)),
-  );
+  const sharedSnapshotBlobs = sharedSnapshotBlobsIn(repoDir, existingCommit);
+  const neededHashes = [...new Set(events.map((event) => event.contentSha256))].sort();
+  const localHashes = neededHashes.filter((contentSha256) => existsSync(join(ledgerDirectory, SNAPSHOT_DIRECTORY, contentSha256)));
+  const blobByHash = new Map<string, string>();
+  if (localHashes.length > 0) {
+    const snapshotPaths = localHashes.map((contentSha256) => join(ledgerDirectory, SNAPSHOT_DIRECTORY, contentSha256));
+    const localBlobs = gitWithInput(repoDir, ["hash-object", "-w", "--stdin-paths"], snapshotPaths.join("\n") + "\n")
+      .trim()
+      .split("\n");
+    localHashes.forEach((contentSha256, index) => blobByHash.set(contentSha256, localBlobs[index]!));
+  }
+  for (const contentSha256 of neededHashes) {
+    const sharedBlob = sharedSnapshotBlobs.get(contentSha256);
+    if (!blobByHash.has(contentSha256) && sharedBlob !== undefined) blobByHash.set(contentSha256, sharedBlob);
+  }
+  const snapshotHashes = neededHashes.filter((contentSha256) => blobByHash.has(contentSha256));
+
   const ledgerBlob = gitWithInput(repoDir, ["hash-object", "-w", "--stdin"], events.map(serializeEvent).join("\n") + "\n").trim();
   const rootEntries = [`100644 blob ${ledgerBlob}\t${LEDGER_FILE}`];
   if (snapshotHashes.length > 0) {
-    const snapshotPaths = snapshotHashes.map((contentSha256) => join(ledgerDirectory, SNAPSHOT_DIRECTORY, contentSha256));
-    const snapshotBlobs = gitWithInput(repoDir, ["hash-object", "-w", "--stdin-paths"], snapshotPaths.join("\n") + "\n")
-      .trim()
-      .split("\n");
-    const snapshotEntries = snapshotHashes.map((contentSha256, index) => `100644 blob ${snapshotBlobs[index]}\t${contentSha256}`);
+    const snapshotEntries = snapshotHashes.map((contentSha256) => `100644 blob ${blobByHash.get(contentSha256)}\t${contentSha256}`);
     const snapshotTree = gitWithInput(repoDir, ["mktree"], snapshotEntries.join("\n") + "\n").trim();
     rootEntries.push(`040000 tree ${snapshotTree}\t${SNAPSHOT_DIRECTORY}`);
   }
   const tree = gitWithInput(repoDir, ["mktree"], rootEntries.join("\n") + "\n").trim();
 
-  const ref = ledgerRefFor(repoDir);
-  const existingCommit = revParse(repoDir, ref);
   const existingTree = existingCommit === null ? null : revParse(repoDir, `${existingCommit}^{tree}`);
   let commit = existingCommit;
   if (existingCommit === null || existingTree !== tree) {
@@ -118,7 +163,7 @@ export function commitLocalLedger(repoDir: string): LedgerCommit | null {
     ref,
     eventCount: events.length,
     snapshotCount: snapshotHashes.length,
-    skippedEventCount: allEvents.length - events.length,
+    skippedEventCount: allEvents.filter((event) => !eventsById.has(event.id)).length,
   };
 }
 
@@ -164,7 +209,7 @@ export interface ProvenanceSource {
 
 export function loadProvenance(repoDir: string): ProvenanceSource {
   const eventsById = new Map<string, LedgerEvent>();
-  const ledgerDirectory = join(repoDir, LEDGER_DIRECTORY);
+  const ledgerDirectory = ledgerDirectoryFor(repoDir);
   const localLedgerPath = join(ledgerDirectory, LEDGER_FILE);
   let localEventCount = 0;
   if (existsSync(localLedgerPath)) {
