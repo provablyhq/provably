@@ -1,34 +1,32 @@
 # provably
 
-Flags the lines an AI wrote in a pull request that no test executes. Warn-only: it annotates the PR and never fails the build.
+Finds the code Claude wrote in a pull request that no test runs, and points it out on the PR.
 
-It knows which lines the AI wrote because it records them at the moment Claude Code writes them, not by guessing from style. A line is flagged only when that record, git blame and your coverage report all agree. Anything uncertain is left out.
+It never guesses. It records which lines Claude writes at the moment it writes them, so a line is only flagged when provably knows the AI wrote it and your coverage report shows no test ran it. It only warns; it never fails a build.
+
+## How it works
+
+1. **You code with Claude Code as usual.** provably notes which lines Claude wrote. Lines you change yourself count as yours.
+2. **You `git push`.** That note goes along with the push, so CI can read it. It is stored out of sight: never in your branches, commits or PRs.
+3. **You open a pull request.** After your tests run, provably marks every Claude-written line in the PR that no test ran, riskiest first.
 
 ## Setup
 
-Requires Node 22 or newer, git, and Claude Code. Once per developer:
+Each developer, once (needs Node 22+, git and Claude Code):
 
 ```sh
 npm install -g provably
 ```
 
-Once per clone, inside the repository:
+In each repository you work in:
 
 ```sh
 provably init
 ```
 
-That is the whole local setup. It:
+Commit the `.claude/settings.json` it creates so your whole team is covered. Teammates who have not installed provably are unaffected.
 
-- adds the capture hooks to `.claude/settings.json` (existing settings and hooks are kept)
-- adds two lines to your git `pre-push` hook (works with plain hooks, `core.hooksPath` and husky)
-- adds `.ai-provenance/` to `.gitignore`
-
-Commit `.claude/settings.json` so the whole team captures. Teammates without provably installed are unaffected; the hook does nothing for them.
-
-## Pull request check
-
-Add one step after your tests in GitHub Actions:
+Then add one step to your GitHub Actions workflow, after the tests:
 
 ```yaml
       - run: npm test -- --coverage
@@ -37,48 +35,41 @@ Add one step after your tests in GitHub Actions:
           coverage: coverage/lcov.info
 ```
 
-The step runs only on pull requests. It posts annotations on the changed lines and a summary table on the run page, using the job's own output, so there is no app to install and no token to configure. Coverage can be lcov (Jest, Vitest, c8, nyc), Cobertura XML (coverage.py, JaCoCo converters, coverlet) or coverage.py JSON. List several reports separated by spaces.
+That is all. No app to install and no token to configure. Works with lcov (Jest, Vitest, c8, nyc), Cobertura XML and coverage.py reports; list several separated by spaces.
 
-## Your workflow does not change
+## Your data
 
-| You do | provably does |
-|---|---|
-| Work with Claude Code as usual | Records which characters Claude wrote, about 40ms per edit, in `.ai-provenance/` |
-| Edit, reformat, amend, rebase, squash | Carries those records forward. Human changes stay human |
-| `git push` | Also pushes the record for files you committed, to `refs/provably/ledgers/<clone-id>` on the same remote |
-| Open a pull request | CI reads every teammate's record and annotates untested AI-written lines, highest risk first |
+- Only notes about files tracked by git are pushed, and only to the remote you push to, which already has your code.
+- Edits to untracked or ignored files (like `.env`) are never pushed.
+- The notes include copies of files as they were while Claude edited them, which can hold text that was never committed. If a secret was ever typed into a tracked file during an AI edit, it is in there. See [Remove](#remove) to delete everything.
 
-## What is shared, and what is not
+## Risky code first
 
-- Shared: records for files tracked in git, plus snapshots of those files at the moments Claude edited them. They go only to the remote you push to, which already holds the code.
-- Never shared: edits to untracked or gitignored files (such as `.env`), and snapshots no shared record refers to.
-- Snapshots can include intermediate versions of tracked files that were never committed. If a secret was ever typed into a tracked file during an AI edit, it is in those snapshots. Run `provably uninstall` and delete the ref (see below) to remove everything.
-
-## Commands
-
-```
-provably init        set up this clone
-provably status      what is installed, recorded and shared
-provably uninstall   remove the hooks again (restores your settings and hook exactly)
-provably check       run the pull request check locally
-provably report      show which lines of a file are AI-authored
-provably sync        share the record now (the pre-push hook does this for you)
-```
-
-To also delete the recorded data after uninstalling:
-
-```sh
-rm -rf .ai-provenance
-git push origin --delete refs/provably/ledgers/$(git config provably.id)
-```
-
-## Risk ordering
-
-Findings that touch payments, auth, security, migrations or infrastructure come first, and each one says why: for example "line 12 uses `stripeClient.charges.create` from `stripe`". To name your own sensitive paths, add `.provably.json`:
+Findings in payments, auth, security, migrations or infrastructure are listed first, with the reason, for example "line 12 uses `stripeClient.charges.create` from `stripe`". To mark your own sensitive paths, add `.provably.json`:
 
 ```json
 { "risk": { "areas": { "payments": ["src/orders/**"] }, "notRisky": ["src/auth/labels.ts"] } }
 ```
+
+## Commands
+
+```
+provably init        set up this repository
+provably status      show what is installed, recorded and pushed
+provably check       run the pull request check on your machine
+provably report      show which lines of a file Claude wrote
+provably uninstall   remove provably's hooks, restoring your files exactly
+```
+
+## Remove
+
+```sh
+provably uninstall
+rm -rf .ai-provenance
+git push origin --delete refs/provably/ledgers/$(git config provably.id)
+```
+
+The last two lines delete the recorded notes, on your machine and on the remote.
 
 ## License
 
