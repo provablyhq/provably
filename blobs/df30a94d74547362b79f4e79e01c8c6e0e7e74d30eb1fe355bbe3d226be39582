@@ -1,0 +1,11 @@
+node_modules/
+*.log
+dist/
+.DS_Store
+.ai-provenance/
+coverage/
+CLAUDE.local.md
+CLAUDE.md
+PLAN.md
+.claude/
+docs/

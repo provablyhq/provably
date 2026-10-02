@@ -1,0 +1,264 @@
+import {
+  readFileSync,
+  writeFileSync,
+  appendFileSync,
+  mkdirSync,
+  existsSync,
+  realpathSync,
+  readdirSync,
+  statSync,
+  rmSync,
+} from "node:fs";
+import { dirname, join, relative, isAbsolute, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { serializeEvent, parseLedger, effectiveAiRanges, type LedgerEvent } from "./ledger.js";
+import { buildChainedEvent, type CaptureSnapshot } from "./chain.js";
+import type { ToolCall } from "./capture.js";
+import { buildBashEvents, type BashFileChange } from "./bash-capture.js";
+import { snapshotWorktree, changedFilesBetween, fileInTree } from "./worktree-snapshot.js";
+import { LEDGER_DIRECTORY, ledgerDirectoryFor, readSnapshot, writeSnapshot } from "./snapshot-store.js";
+import { isMainModule } from "./entry.js";
+
+const LEDGER_FILE = "ledger.jsonl";
+const PENDING_DIRECTORY = "pending";
+const PENDING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function readStdin(): string {
+  try {
+    return readFileSync(0, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function canonical(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+
+function gitRootFor(startDir: string): string | null {
+  try {
+    return execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd: startDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function repoRootFor(startDir: string): string {
+  return gitRootFor(startDir) ?? startDir;
+}
+
+function modelFromTranscript(transcriptPath: unknown): string | null {
+  if (typeof transcriptPath !== "string" || transcriptPath === "") return null;
+  let raw: string;
+  try {
+    raw = readFileSync(transcriptPath, "utf8");
+  } catch {
+    return null;
+  }
+  const lines = raw.split("\n");
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const line = lines[index]!.trim();
+    if (line === "") continue;
+    try {
+      const entry = JSON.parse(line) as { message?: { model?: unknown } };
+      const model = entry.message?.model;
+      if (typeof model === "string" && model !== "") return model;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function resolveModel(payload: Record<string, unknown>): string | null {
+  if (typeof payload.model === "string" && payload.model !== "") return payload.model;
+  const fromEnvironment = process.env.PROVABLY_MODEL;
+  if (typeof fromEnvironment === "string" && fromEnvironment !== "") return fromEnvironment;
+  return modelFromTranscript(payload.transcript_path);
+}
+
+function previousSnapshot(ledgerDirectory: string, file: string): CaptureSnapshot | null {
+  let events: LedgerEvent[];
+  try {
+    events = parseLedger(readFileSync(join(ledgerDirectory, LEDGER_FILE), "utf8"));
+  } catch {
+    return null;
+  }
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]!;
+    if (event.file !== file) continue;
+    const content = readSnapshot(ledgerDirectory, event.contentSha256);
+    return content === null ? null : { content, fileAiRanges: effectiveAiRanges(event) };
+  }
+  return null;
+}
+
+function toolName(payload: Record<string, unknown>): string {
+  return typeof payload.tool_name === "string" ? payload.tool_name : "";
+}
+
+function capturingTool(): string {
+  const fromEnvironment = process.env.PROVABLY_TOOL;
+  return typeof fromEnvironment === "string" && fromEnvironment !== "" ? fromEnvironment : "claude-code";
+}
+
+function payloadCwd(payload: Record<string, unknown>): string {
+  return typeof payload.cwd === "string" && payload.cwd !== "" ? payload.cwd : process.cwd();
+}
+
+function appendEvent(ledgerDirectory: string, event: LedgerEvent, content: string): void {
+  writeSnapshot(ledgerDirectory, event.contentSha256, content);
+  appendFileSync(join(ledgerDirectory, LEDGER_FILE), serializeEvent(event) + "\n", "utf8");
+}
+
+function handleFileTool(payload: Record<string, unknown>): void {
+  const toolInput = (payload.tool_input ?? {}) as Record<string, unknown>;
+  const filePathValue = toolInput.file_path;
+  if (typeof filePathValue !== "string" || filePathValue === "") return;
+
+  const rawFilePath = isAbsolute(filePathValue) ? filePathValue : resolve(payloadCwd(payload), filePathValue);
+  if (!existsSync(rawFilePath)) return;
+  const absoluteFilePath = canonical(rawFilePath);
+
+  const root = canonical(repoRootFor(dirname(absoluteFilePath)));
+  const relativeFilePath = relative(root, absoluteFilePath);
+  if (relativeFilePath === "" || relativeFilePath.startsWith("..")) return;
+  if (relativeFilePath.split(/[\\/]/).includes(LEDGER_DIRECTORY)) return;
+
+  const content = readFileSync(absoluteFilePath, "utf8");
+  const call: ToolCall = { toolName: toolName(payload), toolInput };
+  const ledgerDirectory = ledgerDirectoryFor(root);
+  const captured = buildChainedEvent({
+    call,
+    content,
+    file: relativeFilePath,
+    tool: capturingTool(),
+    model: resolveModel(payload),
+    previous: previousSnapshot(ledgerDirectory, relativeFilePath),
+  });
+  if (captured === null) return;
+  appendEvent(ledgerDirectory, captured.event, content);
+}
+
+function bashCommand(payload: Record<string, unknown>): string {
+  const toolInput = (payload.tool_input ?? {}) as Record<string, unknown>;
+  return typeof toolInput.command === "string" ? toolInput.command : "";
+}
+
+function pendingKey(payload: Record<string, unknown>, command: string): string {
+  const raw = typeof payload.tool_use_id === "string" && payload.tool_use_id !== "" ? payload.tool_use_id : command;
+  return createHash("sha256").update(raw, "utf8").digest("hex");
+}
+
+function prunePending(pendingDirectory: string): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(pendingDirectory);
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  for (const entry of entries) {
+    const path = join(pendingDirectory, entry);
+    try {
+      if (now - statSync(path).mtimeMs > PENDING_MAX_AGE_MS) rmSync(path, { force: true });
+    } catch {
+      continue;
+    }
+  }
+}
+
+function handleBashBefore(payload: Record<string, unknown>): void {
+  const command = bashCommand(payload);
+  if (command === "") return;
+  const root = gitRootFor(payloadCwd(payload));
+  if (root === null) return;
+  const pendingDirectory = join(ledgerDirectoryFor(root), PENDING_DIRECTORY);
+  mkdirSync(pendingDirectory, { recursive: true });
+  prunePending(pendingDirectory);
+  const tree = snapshotWorktree(root);
+  writeFileSync(join(pendingDirectory, pendingKey(payload, command)), tree, "utf8");
+}
+
+function handleBashAfter(payload: Record<string, unknown>): void {
+  const command = bashCommand(payload);
+  if (command === "") return;
+  const root = gitRootFor(payloadCwd(payload));
+  if (root === null) return;
+  const ledgerDirectory = ledgerDirectoryFor(root);
+  const pendingPath = join(ledgerDirectory, PENDING_DIRECTORY, pendingKey(payload, command));
+  if (!existsSync(pendingPath)) return;
+  const beforeTree = readFileSync(pendingPath, "utf8").trim();
+  rmSync(pendingPath, { force: true });
+
+  const afterTree = snapshotWorktree(root);
+  if (afterTree === beforeTree) return;
+
+  const changes: BashFileChange[] = [];
+  for (const changed of changedFilesBetween(root, beforeTree, afterTree)) {
+    if (changed.path.split("/").includes(LEDGER_DIRECTORY)) continue;
+    changes.push({
+      path: changed.path,
+      before: changed.status === "added" ? "" : fileInTree(root, beforeTree, changed.path),
+      after: fileInTree(root, afterTree, changed.path),
+    });
+  }
+
+  const captured = buildBashEvents({
+    command,
+    changes,
+    tool: capturingTool(),
+    model: resolveModel(payload),
+    previousFor: (file) => previousSnapshot(ledgerDirectory, file),
+  });
+  for (const { event, content } of captured) appendEvent(ledgerDirectory, event, content);
+}
+
+function main(): void {
+  const raw = readStdin();
+  if (raw.trim() === "") return;
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+
+  if (toolName(payload) === "Bash") {
+    if (payload.hook_event_name === "PreToolUse") handleBashBefore(payload);
+    else handleBashAfter(payload);
+    return;
+  }
+  handleFileTool(payload);
+}
+
+function logFailure(error: unknown): void {
+  try {
+    const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
+    appendFileSync(join(tmpdir(), "provably-hook-errors.log"), `${new Date().toISOString()} ${message}\n`, "utf8");
+  } catch {
+    return;
+  }
+}
+
+export function runCaptureHook(): number {
+  try {
+    main();
+  } catch (error) {
+    logFailure(error);
+  }
+  return 0;
+}
+
+if (isMainModule(import.meta.url)) process.exit(runCaptureHook());

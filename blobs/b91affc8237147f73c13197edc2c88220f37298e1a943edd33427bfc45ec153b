@@ -1,0 +1,362 @@
+export type RiskTier = "high" | "elevated" | "standard";
+export type RiskEvidenceSource = "config" | "call" | "import" | "path";
+
+export interface RiskEvidence {
+  readonly area: string;
+  readonly source: RiskEvidenceSource;
+  readonly detail: string;
+  readonly line: number | null;
+}
+
+export interface RiskAssessment {
+  readonly tier: RiskTier;
+  readonly area: string | null;
+  readonly evidence: readonly RiskEvidence[];
+}
+
+export const STANDARD_RISK: RiskAssessment = { tier: "standard", area: null, evidence: [] };
+
+export interface RiskConfig {
+  readonly areas: ReadonlyArray<{ readonly area: string; readonly patterns: readonly string[] }>;
+  readonly notRisky: readonly string[];
+}
+
+export const EMPTY_RISK_CONFIG: RiskConfig = { areas: [], notRisky: [] };
+export const RISK_CONFIG_FILE = ".codeprov.json";
+
+const PATH_AREA_WORDS: ReadonlyArray<readonly [area: string, words: readonly string[]]> = [
+  ["auth", ["auth", "authn", "authz", "oauth", "authentication", "authorization", "login", "logout", "signin", "signup", "session", "sessions", "password", "passwords", "credential", "credentials", "jwt", "sso", "saml", "oidc"]],
+  ["security", ["security", "crypto", "cryptography", "encrypt", "encryption", "decrypt", "secret", "secrets", "permission", "permissions", "acl", "rbac", "sanitize", "csrf", "xss"]],
+  ["payments", ["payment", "payments", "billing", "checkout", "invoice", "invoices", "stripe", "paypal", "subscription", "subscriptions", "refund", "refunds", "pricing", "charge", "charges", "wallet"]],
+  ["migrations", ["migration", "migrations", "migrate", "alembic", "flyway", "liquibase"]],
+  ["infra", ["infra", "infrastructure", "terraform", "deploy", "deployment", "deployments", "k8s", "kubernetes", "helm", "dockerfile", "ansible", "workflows", "cloudformation", "pulumi"]],
+];
+
+const PATH_AREA_EXTENSIONS: ReadonlyArray<readonly [area: string, extension: string]> = [
+  ["infra", ".tf"],
+  ["infra", ".tfvars"],
+  ["migrations", ".sql"],
+];
+
+const MODULE_AREAS: ReadonlyArray<readonly [area: string, modules: readonly string[]]> = [
+  ["auth", [
+    "jsonwebtoken", "jose", "jwt", "passport", "passport-", "next-auth", "@auth", "@clerk", "express-session", "cookie-session",
+    "bcrypt", "bcryptjs", "argon2", "@node-rs/argon2", "@node-rs/bcrypt", "openid-client", "@okta", "auth0", "@auth0",
+    "passlib", "flask_login", "django.contrib.auth", "authlib", "oauthlib", "itsdangerous",
+  ]],
+  ["security", [
+    "crypto", "node:crypto", "cryptography", "Crypto", "nacl", "tweetnacl", "libsodium-wrappers", "@aws-sdk/client-kms", "secrets", "hmac",
+  ]],
+  ["payments", [
+    "stripe", "@stripe", "braintree", "paypalrestsdk", "paypal-rest-sdk", "@paypal", "square", "adyen", "@adyen", "razorpay", "mollie", "@mollie", "plaid",
+  ]],
+  ["migrations", ["alembic", "django.db.migrations", "umzug"]],
+  ["infra", ["pulumi", "@pulumi", "aws-cdk-lib", "@aws-cdk", "cdktf"]],
+];
+
+const DDL_PATTERN = /\b(ALTER\s+TABLE|CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX)|DROP\s+(?:TABLE|INDEX|COLUMN)|ADD\s+COLUMN|RENAME\s+(?:TABLE|COLUMN))\b/;
+
+export function pathWords(path: string): string[] {
+  return path
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word !== "");
+}
+
+export function assessPathRisk(path: string): RiskEvidence | null {
+  const words = new Set(pathWords(path));
+  for (const [area, areaWords] of PATH_AREA_WORDS) {
+    const matched = areaWords.find((word) => words.has(word));
+    if (matched !== undefined) return { area, source: "path", detail: `path contains \`${matched}\``, line: null };
+  }
+  const lowerPath = path.toLowerCase();
+  for (const [area, extension] of PATH_AREA_EXTENSIONS) {
+    if (lowerPath.endsWith(extension)) return { area, source: "path", detail: `\`${extension}\` file`, line: null };
+  }
+  return null;
+}
+
+export function areaForModule(moduleName: string): string | null {
+  for (const [area, modules] of MODULE_AREAS) {
+    for (const entry of modules) {
+      if (entry.endsWith("-") && moduleName.startsWith(entry)) return area;
+      if (moduleName === entry || moduleName.startsWith(`${entry}/`) || moduleName.startsWith(`${entry}.`)) return area;
+    }
+  }
+  return null;
+}
+
+export interface ImportBinding {
+  readonly moduleName: string;
+  readonly localNames: readonly string[];
+  readonly line: number;
+}
+
+export type SourceLanguage = "javascript" | "python" | "other";
+
+export function sourceLanguage(path: string): SourceLanguage {
+  if (/\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|vue|svelte)$/i.test(path)) return "javascript";
+  if (/\.py$/i.test(path)) return "python";
+  return "other";
+}
+
+export function parseImports(path: string, content: string): ImportBinding[] {
+  const language = sourceLanguage(path);
+  if (language === "javascript") return parseJavaScriptImports(content);
+  if (language === "python") return parsePythonImports(content);
+  return [];
+}
+
+function lineNumberAt(content: string, offset: number): number {
+  let lineNumber = 1;
+  for (let index = 0; index < offset; index++) if (content.charCodeAt(index) === 10) lineNumber++;
+  return lineNumber;
+}
+
+function parseJavaScriptImports(content: string): ImportBinding[] {
+  const bindings: ImportBinding[] = [];
+  for (const match of content.matchAll(/\bimport\s+(type\s+)?([\w$*{}\s,]+?)\s+from\s+["']([^"']+)["']/g)) {
+    if (match[1] !== undefined) continue;
+    bindings.push({ moduleName: match[3]!, localNames: javaScriptClauseNames(match[2]!), line: lineNumberAt(content, match.index) });
+  }
+  for (const match of content.matchAll(/\bimport\s+["']([^"']+)["']/g)) {
+    bindings.push({ moduleName: match[1]!, localNames: [], line: lineNumberAt(content, match.index) });
+  }
+  for (const match of content.matchAll(/\b(?:const|let|var)\s+([\w$]+|\{[^}]*\})\s*=\s*(?:await\s+)?(?:require|import)\(\s*["']([^"']+)["']\s*\)/g)) {
+    bindings.push({ moduleName: match[2]!, localNames: javaScriptClauseNames(match[1]!), line: lineNumberAt(content, match.index) });
+  }
+  return bindings;
+}
+
+function javaScriptClauseNames(clause: string): string[] {
+  const names: string[] = [];
+  const braced = /\{([^}]*)\}/.exec(clause);
+  if (braced !== null) {
+    for (const part of braced[1]!.split(",")) {
+      const specifier = part.trim().replace(/^type\s+/, "");
+      if (specifier === "" || part.trim().startsWith("type ")) continue;
+      const renamed = /^[\w$]+(?:\s+as\s+|\s*:\s*)([\w$]+)$/.exec(specifier);
+      names.push(renamed !== null ? renamed[1]! : specifier);
+    }
+  }
+  const outside = clause.replace(/\{[^}]*\}/, "");
+  const namespace = /\*\s*as\s+([\w$]+)/.exec(outside);
+  if (namespace !== null) names.push(namespace[1]!);
+  for (const part of outside.replace(/\*\s*as\s+[\w$]+/, "").split(",")) {
+    const name = part.trim();
+    if (/^[\w$]+$/.test(name)) names.push(name);
+  }
+  return names;
+}
+
+function parsePythonImports(content: string): ImportBinding[] {
+  const bindings: ImportBinding[] = [];
+  const lines = content.split("\n");
+  for (let index = 0; index < lines.length; index++) {
+    const lineNumber = index + 1;
+    let line = lines[index]!.replace(/#.*$/, "").trim();
+    if (/^from\s+[\w.]+\s+import\s+\(/.test(line)) {
+      while (!line.includes(")") && index + 1 < lines.length) {
+        index++;
+        line += ` ${lines[index]!.replace(/#.*$/, "").trim()}`;
+      }
+      line = line.replace(/[()]/g, " ");
+    }
+    const fromImport = /^from\s+([\w.]+)\s+import\s+(.+)$/.exec(line);
+    if (fromImport !== null) {
+      const localNames = fromImport[2]!
+        .split(",")
+        .map((part) => part.trim())
+        .filter((part) => part !== "" && part !== "*")
+        .map((part) => /\bas\s+(\w+)$/.exec(part)?.[1] ?? part.split(/\s+/)[0]!);
+      bindings.push({ moduleName: fromImport[1]!, localNames, line: lineNumber });
+      continue;
+    }
+    const plainImport = /^import\s+(.+)$/.exec(line);
+    if (plainImport === null) continue;
+    for (const part of plainImport[1]!.split(",")) {
+      const specifier = /^([\w.]+)(?:\s+as\s+(\w+))?$/.exec(part.trim());
+      if (specifier === null) continue;
+      bindings.push({ moduleName: specifier[1]!, localNames: [specifier[2] ?? specifier[1]!.split(".")[0]!], line: lineNumber });
+    }
+  }
+  return bindings;
+}
+
+export interface RiskyBinding {
+  readonly area: string;
+  readonly moduleName: string;
+}
+
+export interface FileRiskContext {
+  readonly file: string;
+  readonly excludedByConfig: boolean;
+  readonly configEvidence: RiskEvidence | null;
+  readonly importEvidence: readonly RiskEvidence[];
+  readonly pathEvidence: RiskEvidence | null;
+  readonly riskyBindings: ReadonlyMap<string, RiskyBinding>;
+  readonly language: SourceLanguage;
+}
+
+export function fileRiskContext(file: string, content: string, config: RiskConfig = EMPTY_RISK_CONFIG): FileRiskContext {
+  const excludedByConfig = config.notRisky.some((pattern) => matchesGlob(pattern, file));
+  const configuredArea = config.areas.find((entry) => entry.patterns.some((pattern) => matchesGlob(pattern, file)));
+  const configEvidence: RiskEvidence | null =
+    configuredArea === undefined
+      ? null
+      : { area: configuredArea.area, source: "config", detail: `listed under \`${configuredArea.area}\` in ${RISK_CONFIG_FILE}`, line: null };
+
+  const importEvidence: RiskEvidence[] = [];
+  const riskyBindings = new Map<string, RiskyBinding>();
+  for (const binding of parseImports(file, content)) {
+    const area = areaForModule(binding.moduleName);
+    if (area === null) continue;
+    importEvidence.push({ area, source: "import", detail: `imports \`${binding.moduleName}\``, line: binding.line });
+    for (const localName of binding.localNames) riskyBindings.set(localName, { area, moduleName: binding.moduleName });
+  }
+  addDerivedBindings(content, riskyBindings);
+
+  return {
+    file,
+    excludedByConfig,
+    configEvidence,
+    importEvidence,
+    pathEvidence: assessPathRisk(file),
+    riskyBindings,
+    language: sourceLanguage(file),
+  };
+}
+
+function addDerivedBindings(content: string, riskyBindings: Map<string, RiskyBinding>): void {
+  for (const [name, binding] of [...riskyBindings]) {
+    const assignment = new RegExp(`([A-Za-z_$][\\w$]*)\\s*=(?!=)\\s*(?:new\\s+|await\\s+)?${escapeRegExp(name)}(?![\\w$])`, "g");
+    for (const match of content.matchAll(assignment)) {
+      if (!riskyBindings.has(match[1]!)) riskyBindings.set(match[1]!, binding);
+    }
+  }
+}
+
+export interface LineText {
+  readonly lineNumber: number;
+  readonly text: string;
+}
+
+export function callEvidenceForLines(context: FileRiskContext, lines: readonly LineText[]): RiskEvidence[] {
+  const evidence: RiskEvidence[] = [];
+  for (const { lineNumber, text } of lines) {
+    const code = stripLineComment(text, context.language);
+    if (/^\s*(import|from)\s/.test(code) || /\brequire\(\s*["']/.test(code)) continue;
+    for (const [name, binding] of context.riskyBindings) {
+      const reference = new RegExp(`(?<![\\w$.])(?:this\\.)?${escapeRegExp(name)}(?![\\w$])(?:\\s*\\.\\s*[A-Za-z_$][\\w$]*)*`).exec(code);
+      if (reference === null) continue;
+      evidence.push({
+        area: binding.area,
+        source: "call",
+        detail: `line ${lineNumber} uses \`${reference[0].replace(/\s+/g, "")}\` from \`${binding.moduleName}\``,
+        line: lineNumber,
+      });
+      break;
+    }
+    const ddl = DDL_PATTERN.exec(code);
+    if (ddl !== null) {
+      evidence.push({ area: "migrations", source: "call", detail: `line ${lineNumber} runs \`${ddl[0].replace(/\s+/g, " ")}\``, line: lineNumber });
+    }
+  }
+  return evidence;
+}
+
+function stripLineComment(text: string, language: SourceLanguage): string {
+  if (language === "python") return text.replace(/#.*$/, "");
+  if (language === "javascript") return text.replace(/(^|[^:])\/\/.*$/, "$1");
+  return text;
+}
+
+export function fileRisk(context: FileRiskContext): RiskAssessment {
+  return combineEvidence(context, []);
+}
+
+export function findingRisk(context: FileRiskContext, lines: readonly LineText[]): RiskAssessment {
+  return combineEvidence(context, callEvidenceForLines(context, lines));
+}
+
+function combineEvidence(context: FileRiskContext, callEvidence: readonly RiskEvidence[]): RiskAssessment {
+  if (context.excludedByConfig) return STANDARD_RISK;
+  const strong = [...(context.configEvidence === null ? [] : [context.configEvidence]), ...callEvidence];
+  const weak = [...context.importEvidence, ...(context.pathEvidence === null ? [] : [context.pathEvidence])];
+  if (strong.length > 0) return { tier: "high", area: strong[0]!.area, evidence: strong };
+  if (weak.length > 0) return { tier: "elevated", area: weak[0]!.area, evidence: weak };
+  return STANDARD_RISK;
+}
+
+export function parseRiskConfig(json: string): RiskConfig {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch (error) {
+    throw new Error(`${RISK_CONFIG_FILE} is not valid JSON: ${(error as Error).message}`);
+  }
+  const risk = (parsed as { risk?: unknown }).risk;
+  if (risk === undefined) return EMPTY_RISK_CONFIG;
+  if (typeof risk !== "object" || risk === null) throw new Error(`${RISK_CONFIG_FILE}: "risk" must be an object`);
+  const { areas = {}, notRisky = [] } = risk as { areas?: unknown; notRisky?: unknown };
+  if (typeof areas !== "object" || areas === null || Array.isArray(areas)) {
+    throw new Error(`${RISK_CONFIG_FILE}: "risk.areas" must map an area name to a list of path globs`);
+  }
+  const parsedAreas = Object.entries(areas as Record<string, unknown>).map(([area, patterns]) => {
+    if (!isStringList(patterns)) throw new Error(`${RISK_CONFIG_FILE}: "risk.areas.${area}" must be a list of path globs`);
+    return { area, patterns };
+  });
+  if (!isStringList(notRisky)) throw new Error(`${RISK_CONFIG_FILE}: "risk.notRisky" must be a list of path globs`);
+  return { areas: parsedAreas, notRisky };
+}
+
+function isStringList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+export function matchesGlob(pattern: string, path: string): boolean {
+  let expression = "";
+  for (let index = 0; index < pattern.length; index++) {
+    const character = pattern[index]!;
+    if (character === "*" && pattern[index + 1] === "*") {
+      const followedBySlash = pattern[index + 2] === "/";
+      expression += followedBySlash ? "(?:.*/)?" : ".*";
+      index += followedBySlash ? 2 : 1;
+    } else if (character === "*") {
+      expression += "[^/]*";
+    } else if (character === "?") {
+      expression += "[^/]";
+    } else {
+      expression += escapeRegExp(character);
+    }
+  }
+  if (pattern.endsWith("/")) expression += ".*";
+  return new RegExp(`^${expression}$`).test(path);
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const LOGIC_PATTERN = /\b(if|else|elif|for|while|switch|case|match|catch|except|throw|raise|return|await|yield)\b|&&|\|\||\s[<>]=?\s|[!=]==?|\?\?|\?\.|\bnot\b|\band\b|\bor\b/;
+
+export function isLogicLine(text: string): boolean {
+  return LOGIC_PATTERN.test(text);
+}
+
+export type FileRole = "source" | "test" | "other";
+
+const SOURCE_EXTENSIONS = new Set([
+  "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "go", "rb", "java", "kt", "kts", "rs", "cs", "php",
+  "swift", "scala", "c", "cc", "cpp", "h", "hpp", "m", "dart", "ex", "exs", "vue", "svelte", "sql", "tf",
+]);
+
+const TEST_PATH_PATTERN =
+  /(^|\/)(test|tests|__tests__|spec|specs|testing|fixtures|__mocks__)\/|\.(test|spec)\.[^/]+$|_test\.[^/]+$|(^|\/)test_[^/]+\.py$|(^|\/)conftest\.py$/;
+
+export function fileRole(path: string): FileRole {
+  const extension = /\.([^./]+)$/.exec(path)?.[1]?.toLowerCase();
+  if (extension === undefined || !SOURCE_EXTENSIONS.has(extension)) return "other";
+  return TEST_PATH_PATTERN.test(path) ? "test" : "source";
+}

@@ -1,0 +1,92 @@
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { git } from "./git.js";
+import { hashContent, labelsFromRanges, type LedgerEvent } from "./ledger.js";
+import { tokenize } from "./tokenize.js";
+import { rollupByLine } from "./lines.js";
+import { resolveFileProvenanceFromHistory } from "./resolve.js";
+import { emptyTotals, accumulateLineCounts, type GradeTotals } from "./grader.js";
+import type { Scenario, TransformationCategory } from "./scenarios.js";
+
+const SAMPLE_FILE = "sample.js";
+
+function initRepo(): string {
+  const dir = mkdtempSync(join(tmpdir(), "codeprov-grade-"));
+  git(dir, ["init", "-q"]);
+  git(dir, ["config", "user.email", "grader@example.com"]);
+  git(dir, ["config", "user.name", "Grader"]);
+  return dir;
+}
+
+function commit(dir: string, content: string, message: string): void {
+  writeFileSync(join(dir, SAMPLE_FILE), content);
+  git(dir, ["add", SAMPLE_FILE]);
+  git(dir, ["commit", "-q", "-m", message]);
+}
+
+export function gradeScenarioWithGit(scenario: Scenario): GradeTotals {
+  const dir = initRepo();
+  try {
+    commit(dir, scenario.base.content, "ai: author");
+    const event: LedgerEvent = {
+      v: 1,
+      id: scenario.name,
+      ts: "2026-10-02T00:00:00.000Z",
+      tool: "claude-code",
+      model: "claude-opus-4-8",
+      file: SAMPLE_FILE,
+      contentSha256: hashContent(scenario.base.content),
+      aiRanges: scenario.base.aiRanges,
+    };
+    if (scenario.head.content !== scenario.base.content) {
+      commit(dir, scenario.head.content, "human: edit");
+    }
+
+    const snapshotFor = (contentSha256: string): string | null =>
+      contentSha256 === event.contentSha256 ? scenario.base.content : null;
+    const resolvedLines = resolveFileProvenanceFromHistory(dir, "HEAD", SAMPLE_FILE, [event], { snapshotFor }).lines;
+
+    const trueLabels = labelsFromRanges(scenario.head.content, scenario.head.aiRanges);
+    const trueTokens = tokenize(scenario.head.content).map((token, tokenIndex) => ({
+      ...token,
+      ai: trueLabels[tokenIndex]!,
+    }));
+    const trueLines = rollupByLine(scenario.head.content, trueTokens);
+
+    const totals = emptyTotals();
+    accumulateLineCounts(totals, resolvedLines, trueLines);
+    return totals;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+export function gradeAllWithGit(scenarios: readonly Scenario[]): {
+  results: { scenario: Scenario; totals: GradeTotals }[];
+  overall: GradeTotals;
+  byCategory: Map<TransformationCategory, GradeTotals>;
+} {
+  const results: { scenario: Scenario; totals: GradeTotals }[] = [];
+  const overall = emptyTotals();
+  const byCategory = new Map<TransformationCategory, GradeTotals>();
+
+  for (const scenario of scenarios) {
+    const totals = gradeScenarioWithGit(scenario);
+    results.push({ scenario, totals });
+    mergeInto(overall, totals);
+    const categoryTotals = byCategory.get(scenario.category) ?? emptyTotals();
+    mergeInto(categoryTotals, totals);
+    byCategory.set(scenario.category, categoryTotals);
+  }
+
+  return { results, overall, byCategory };
+}
+
+function mergeInto(target: GradeTotals, source: GradeTotals): void {
+  target.pureHumanLines += source.pureHumanLines;
+  target.pureHumanLinesFlagged += source.pureHumanLinesFlagged;
+  target.aiLineTruePositive += source.aiLineTruePositive;
+  target.aiLineFalsePositive += source.aiLineFalsePositive;
+  target.aiLineFalseNegative += source.aiLineFalseNegative;
+}

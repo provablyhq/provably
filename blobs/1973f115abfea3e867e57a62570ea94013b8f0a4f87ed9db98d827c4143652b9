@@ -1,0 +1,288 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { git, parseAddedLines } from "./git.js";
+import { hashContent, type LedgerEvent } from "./ledger.js";
+import { alignCoverageToRepo, coverageForFile, parseCobertura, parseCoverage, parseCoveragePyJson, parseLcov } from "./coverage.js";
+import { analyzePullRequest, checkRunPayload } from "./pr-check.js";
+
+test("parseLcov reads line hits per source file", () => {
+  const report = parseLcov("TN:\nSF:/ci/repo/src/a.ts\nDA:1,3\nDA:2,0\nend_of_record\nSF:src/b.ts\nDA:5,1\nend_of_record\n");
+  assert.deepEqual([...report.get("/ci/repo/src/a.ts")!], [[1, 3], [2, 0]]);
+  assert.deepEqual([...report.get("src/b.ts")!], [[5, 1]]);
+});
+
+test("parseCobertura joins a single source root with class filenames", () => {
+  const xml =
+    '<?xml version="1.0"?><coverage><sources><source>/ci/repo</source></sources><packages><package><classes>' +
+    '<class name="a" filename="src/a.py"><methods/><lines><line number="1" hits="0"/><line hits="2" number="2"/></lines></class>' +
+    "</classes></package></packages></coverage>";
+  const report = parseCobertura(xml);
+  assert.deepEqual([...report.get("/ci/repo/src/a.py")!], [[1, 0], [2, 2]]);
+});
+
+test("parseCoveragePyJson marks executed and missing lines", () => {
+  const report = parseCoveragePyJson(JSON.stringify({ files: { "src/a.py": { executed_lines: [1, 3], missing_lines: [2] } } }));
+  assert.deepEqual([...report.get("src/a.py")!].sort(([left], [right]) => left - right), [[1, 1], [2, 0], [3, 1]]);
+});
+
+test("parseCoverage detects the format", () => {
+  assert.ok(parseCoverage("SF:a.ts\nDA:1,1\nend_of_record\n").has("a.ts"));
+  assert.ok(parseCoverage('{"files": {"a.py": {"executed_lines": [1]}}}').has("a.py"));
+  assert.throws(() => parseCoverage("nothing useful"));
+});
+
+test("alignCoverageToRepo strips the CI checkout prefix and never guesses between files", () => {
+  const report = parseLcov(
+    "SF:/ci/repo/src/a.ts\nDA:1,1\nend_of_record\n" +
+      "SF:/ci/repo/lib/index.ts\nDA:2,0\nend_of_record\n" +
+      "SF:/elsewhere/vendor.ts\nDA:1,1\nend_of_record\n",
+  );
+  const aligned = alignCoverageToRepo(report, ["src/a.ts", "a.ts", "lib/index.ts", "index.ts"]);
+  assert.deepEqual([...aligned.get("src/a.ts")!], [[1, 1]]);
+  assert.equal(coverageForFile(aligned, "a.ts"), null, "a root file never borrows a nested file's coverage");
+  assert.equal(coverageForFile(aligned, "index.ts"), null);
+  assert.deepEqual([...aligned.get("lib/index.ts")!], [[2, 0]]);
+  assert.equal(aligned.size, 2, "files outside the repository are dropped");
+});
+
+test("parseAddedLines reads new-side line numbers from a zero-context diff", () => {
+  const diff = [
+    "diff --git a/src/a.ts b/src/a.ts",
+    "--- a/src/a.ts",
+    "+++ b/src/a.ts",
+    "@@ -3,0 +4,2 @@",
+    "+one",
+    "+two",
+    "@@ -10 +12 @@",
+    "-old",
+    "+new",
+    "@@ -20,2 +22,0 @@",
+    "diff --git a/gone.ts b/gone.ts",
+    "--- a/gone.ts",
+    "+++ /dev/null",
+    "@@ -1,2 +0,0 @@",
+    'diff --git "a/sp\\303\\251cial.ts" "b/sp\\303\\251cial.ts"',
+    '+++ "b/sp\\303\\251cial.ts"',
+    "@@ -0,0 +1 @@",
+  ].join("\n");
+  const added = parseAddedLines(diff);
+  assert.deepEqual([...added.get("src/a.ts")!], [4, 5, 12]);
+  assert.equal(added.has("gone.ts"), false);
+  assert.deepEqual([...added.get("spécial.ts")!], [1]);
+});
+
+function initRepo(): string {
+  const dir = mkdtempSync(join(tmpdir(), "codeprov-check-"));
+  git(dir, ["init", "-q", "-b", "main"]);
+  git(dir, ["config", "user.email", "test@example.com"]);
+  git(dir, ["config", "user.name", "Test"]);
+  return dir;
+}
+
+function commitFile(dir: string, file: string, content: string, message: string): void {
+  mkdirSync(dirname(join(dir, file)), { recursive: true });
+  writeFileSync(join(dir, file), content);
+  git(dir, ["add", file]);
+  git(dir, ["commit", "-q", "-m", message]);
+}
+
+function lineOf(content: string, needle: string): number {
+  return content.slice(0, content.indexOf(needle)).split("\n").length;
+}
+
+test("analyzePullRequest flags only AI-authored added lines that tests never executed", () => {
+  const dir = initRepo();
+  try {
+    const file = "src/billing/discount.js";
+    const baseContent = "export function base(price) {\n  return price;\n}\n";
+    commitFile(dir, file, baseContent, "human: base");
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+
+    const aiFunction =
+      "export function discount(price, coupon) {\n" +
+      "  if (coupon === null) {\n" +
+      "    return price;\n" +
+      "  }\n" +
+      "  const reduced = price * (1 - coupon.rate);\n" +
+      "  return Math.max(reduced, 0);\n" +
+      "}\n";
+    const headContent = baseContent + aiFunction + "export const humanDefault = base(10);\n";
+    commitFile(dir, file, headContent, "feature: discount");
+
+    const aiStart = headContent.indexOf(aiFunction);
+    const event: LedgerEvent = {
+      v: 1,
+      id: "event-discount",
+      ts: "2026-10-02T00:00:00.000Z",
+      tool: "claude-code",
+      model: "claude-opus-5-5",
+      file,
+      contentSha256: hashContent(headContent),
+      aiRanges: [[aiStart, aiStart + aiFunction.length]],
+    };
+
+    const coveredLine = lineOf(headContent, "if (coupon === null)");
+    const uncoveredEarlyReturn = lineOf(headContent, "    return price;\n  }");
+    const uncoveredReduced = lineOf(headContent, "const reduced");
+    const uncoveredFinalReturn = lineOf(headContent, "Math.max");
+    const humanLine = lineOf(headContent, "humanDefault");
+    const lcov =
+      `SF:/ci/checkout/${file}\n` +
+      `DA:${coveredLine},4\nDA:${uncoveredEarlyReturn},0\nDA:${uncoveredReduced},0\nDA:${uncoveredFinalReturn},0\nDA:${humanLine},0\n` +
+      "end_of_record\n";
+
+    const result = analyzePullRequest({ repoDir: dir, baseRev: "main", headRev: "HEAD", events: [event], coverage: parseCoverage(lcov) });
+
+    assert.equal(result.files.length, 1);
+    assert.equal(result.files[0]!.aiAddedLineCount, 7);
+    assert.equal(result.files[0]!.uncoveredAiLineCount, 3);
+
+    const flaggedLines = result.findings.flatMap((finding) =>
+      Array.from({ length: finding.endLine - finding.startLine + 1 }, (_, offset) => finding.startLine + offset),
+    );
+    assert.ok(!flaggedLines.includes(humanLine), "an uncovered human line is never flagged");
+    assert.ok(!flaggedLines.includes(coveredLine), "a covered AI line is not flagged");
+    assert.ok(flaggedLines.includes(uncoveredReduced) && flaggedLines.includes(uncoveredFinalReturn));
+    assert.ok(result.findings.every((finding) => finding.eventIds.includes("event-discount")));
+
+    const payload = checkRunPayload(result);
+    assert.equal(payload.conclusion, "neutral");
+    assert.equal(payload.head_sha, result.headCommit);
+    assert.equal(payload.output.title, "3 AI-authored lines not covered by tests");
+    assert.ok(
+      payload.output.annotations.every((annotation) => annotation.annotation_level === "notice"),
+      "a risky path word alone is only elevated, not high",
+    );
+    assert.ok(payload.output.annotations.every((annotation) => annotation.message.includes("path contains `billing`")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("analyzePullRequest ignores AI lines that were already on the base branch", () => {
+  const dir = initRepo();
+  try {
+    const file = "src/util.js";
+    const aiContent = "export function clampValue(value) {\n  return Math.min(Math.max(value, 0), 100);\n}\n";
+    commitFile(dir, file, aiContent, "ai: clamp");
+    const event: LedgerEvent = {
+      v: 1,
+      id: "event-clamp",
+      ts: "2026-10-02T00:00:00.000Z",
+      tool: "claude-code",
+      model: null,
+      file,
+      contentSha256: hashContent(aiContent),
+      aiRanges: [[0, aiContent.length]],
+    };
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    const headContent = aiContent + "export const limit = clampValue(500);\n";
+    commitFile(dir, file, headContent, "human: use clamp");
+
+    const lcov = `SF:${file}\nDA:1,0\nDA:2,0\nDA:4,0\nend_of_record\n`;
+    const result = analyzePullRequest({ repoDir: dir, baseRev: "main", headRev: "HEAD", events: [event], coverage: parseCoverage(lcov) });
+    assert.equal(result.findings.length, 0);
+    assert.equal(checkRunPayload(result).conclusion, "success");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a file missing from the coverage report is listed but never annotated", () => {
+  const dir = initRepo();
+  try {
+    commitFile(dir, "README.md", "readme\n", "init");
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    const file = "src/new.js";
+    const content = "export function makeGreeting(name) {\n  return `hello ${name}`;\n}\n";
+    commitFile(dir, file, content, "ai: greeting");
+    const event: LedgerEvent = {
+      v: 1,
+      id: "event-greeting",
+      ts: "2026-10-02T00:00:00.000Z",
+      tool: "claude-code",
+      model: null,
+      file,
+      contentSha256: hashContent(content),
+      aiRanges: [[0, content.length]],
+    };
+    const result = analyzePullRequest({ repoDir: dir, baseRev: "main", headRev: "HEAD", events: [event], coverage: new Map() });
+    assert.equal(result.findings.length, 0);
+    assert.equal(result.files[0]?.coverageStatus, "missing-from-report");
+    assert.match(checkRunPayload(result).output.summary, /no entry in the coverage report/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a flagged line that calls a payment SDK is high risk and says why", () => {
+  const dir = initRepo();
+  try {
+    commitFile(dir, "README.md", "readme\n", "init");
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    const file = "src/api/orders.js";
+    const content =
+      'import Stripe from "stripe";\n' +
+      "const stripeClient = new Stripe(process.env.STRIPE_KEY);\n" +
+      "export async function placeOrder(order) {\n" +
+      "  const total = order.items.length * 100;\n" +
+      "  return stripeClient.charges.create({ amount: total });\n" +
+      "}\n" +
+      "export function describeOrder(order) {\n" +
+      "  return `order ${order.id}`;\n" +
+      "}\n";
+    commitFile(dir, file, content, "ai: orders");
+    const event: LedgerEvent = {
+      v: 1,
+      id: "event-orders",
+      ts: "2026-10-02T00:00:00.000Z",
+      tool: "claude-code",
+      model: null,
+      file,
+      contentSha256: hashContent(content),
+      aiRanges: [[0, content.length]],
+    };
+    const chargeLine = lineOf(content, "charges.create");
+    const describeLine = lineOf(content, "return `order");
+    const lcov = `SF:${file}\nDA:${chargeLine},0\nDA:${describeLine},0\nDA:${chargeLine - 1},1\nDA:${describeLine - 1},1\nend_of_record\n`;
+    const result = analyzePullRequest({ repoDir: dir, baseRev: "main", headRev: "HEAD", events: [event], coverage: parseCoverage(lcov) });
+
+    const chargeFinding = result.findings.find((finding) => finding.startLine === chargeLine)!;
+    const describeFinding = result.findings.find((finding) => finding.startLine === describeLine)!;
+    assert.equal(chargeFinding.risk.tier, "high");
+    assert.equal(chargeFinding.risk.area, "payments");
+    assert.equal(describeFinding.risk.tier, "elevated", "same file, but the line itself never touches the SDK");
+    assert.equal(result.findings[0], chargeFinding, "the payment call ranks first");
+
+    const annotation = checkRunPayload(result).output.annotations[0]!;
+    assert.equal(annotation.annotation_level, "warning");
+    assert.match(annotation.message, /uses `stripeClient\.charges\.create` from `stripe`/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the repository risk config overrides the built-in guesses", () => {
+  const dir = initRepo();
+  try {
+    commitFile(dir, ".codeprov.json", JSON.stringify({ risk: { areas: { payments: ["src/ledgerbook/**"] }, notRisky: ["src/auth/labels.js"] } }), "config");
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    const files = { "src/ledgerbook/post.js": "export function postEntry(entry) {\n  return entry.amount > 0;\n}\n", "src/auth/labels.js": "export function loginLabel(name) {\n  return name.trim();\n}\n" };
+    const events: LedgerEvent[] = [];
+    for (const [file, content] of Object.entries(files)) {
+      commitFile(dir, file, content, `ai: ${file}`);
+      events.push({ v: 1, id: `event-${file}`, ts: "2026-10-02T00:00:00.000Z", tool: "claude-code", model: null, file, contentSha256: hashContent(content), aiRanges: [[0, content.length]] });
+    }
+    const lcov = Object.keys(files).map((file) => `SF:${file}\nDA:2,0\nend_of_record\n`).join("");
+    const result = analyzePullRequest({ repoDir: dir, baseRev: "main", headRev: "HEAD", events, coverage: parseCoverage(lcov) });
+    const riskByFile = new Map(result.findings.map((finding) => [finding.file, finding.risk]));
+    assert.equal(riskByFile.get("src/ledgerbook/post.js")?.tier, "high");
+    assert.equal(riskByFile.get("src/ledgerbook/post.js")?.evidence[0]?.source, "config");
+    assert.equal(riskByFile.get("src/auth/labels.js")?.tier, "standard", "notRisky silences the auth path word");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

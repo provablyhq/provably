@@ -1,0 +1,207 @@
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
+import { git } from "./git.js";
+import { cloneId } from "./ledger-sync.js";
+import { LEDGER_DIRECTORY } from "./snapshot-store.js";
+
+export const CAPTURE_COMMAND = "command -v codeprov >/dev/null 2>&1 && codeprov capture || true";
+export const HOOK_BLOCK_START = "# >>> codeprov >>>";
+export const HOOK_BLOCK_END = "# <<< codeprov <<<";
+export const PRE_PUSH_BLOCK = [
+  HOOK_BLOCK_START,
+  'command -v codeprov >/dev/null 2>&1 && codeprov sync --remote "$1" --quiet </dev/null || true',
+  HOOK_BLOCK_END,
+].join("\n");
+
+const CLAUDE_SETTINGS_FILE = join(".claude", "settings.json");
+const CAPTURE_HOOKS: ReadonlyArray<readonly [event: string, matcher: string]> = [
+  ["PostToolUse", "Write|Edit|MultiEdit|Bash"],
+  ["PreToolUse", "Bash"],
+];
+
+interface HookEntry {
+  matcher?: string;
+  hooks?: Array<{ type?: string; command?: string }>;
+}
+
+export type StepOutcome = "added" | "already-present";
+
+export function hasCaptureHook(entries: readonly HookEntry[] | undefined): boolean {
+  return (entries ?? []).some((entry) => (entry.hooks ?? []).some((hook) => (hook.command ?? "").includes("codeprov capture") || (hook.command ?? "").includes("capture-hook")));
+}
+
+export function installClaudeHooks(repoRoot: string): StepOutcome {
+  const settingsPath = join(repoRoot, CLAUDE_SETTINGS_FILE);
+  let settings: { hooks?: Record<string, HookEntry[]> } & Record<string, unknown> = {};
+  if (existsSync(settingsPath)) {
+    try {
+      settings = JSON.parse(readFileSync(settingsPath, "utf8")) as typeof settings;
+    } catch (error) {
+      throw new Error(`${CLAUDE_SETTINGS_FILE} is not valid JSON, so it was left untouched: ${(error as Error).message}`);
+    }
+  }
+  const hooks = settings.hooks ?? {};
+  let changed = false;
+  for (const [event, matcher] of CAPTURE_HOOKS) {
+    if (hasCaptureHook(hooks[event])) continue;
+    hooks[event] = [...(hooks[event] ?? []), { matcher, hooks: [{ type: "command", command: CAPTURE_COMMAND }] }];
+    changed = true;
+  }
+  if (!changed) return "already-present";
+  settings.hooks = hooks;
+  mkdirSync(dirname(settingsPath), { recursive: true });
+  writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  return "added";
+}
+
+export function prePushHookPath(repoRoot: string): string {
+  const hooksDirectoryOutput = git(repoRoot, ["rev-parse", "--git-path", "hooks"]).trim();
+  const hooksDirectory = isAbsolute(hooksDirectoryOutput) ? hooksDirectoryOutput : join(repoRoot, hooksDirectoryOutput);
+  const huskyGenerated = basename(hooksDirectory) === "_" && basename(dirname(hooksDirectory)) === ".husky";
+  return join(huskyGenerated ? dirname(hooksDirectory) : hooksDirectory, "pre-push");
+}
+
+export function insertHookBlock(existingScript: string | null): string {
+  if (existingScript === null || existingScript.trim() === "") return `#!/bin/sh\n${PRE_PUSH_BLOCK}\n`;
+  const lines = existingScript.split("\n");
+  const insertAt = lines[0]!.startsWith("#!") ? 1 : 0;
+  lines.splice(insertAt, 0, PRE_PUSH_BLOCK);
+  return lines.join("\n");
+}
+
+export function installPrePushHook(repoRoot: string): { outcome: StepOutcome; path: string } {
+  const hookPath = prePushHookPath(repoRoot);
+  const existing = existsSync(hookPath) ? readFileSync(hookPath, "utf8") : null;
+  if (existing !== null && existing.includes(HOOK_BLOCK_START)) return { outcome: "already-present", path: hookPath };
+  mkdirSync(dirname(hookPath), { recursive: true });
+  writeFileSync(hookPath, insertHookBlock(existing), "utf8");
+  chmodSync(hookPath, 0o755);
+  return { outcome: "added", path: hookPath };
+}
+
+export function ensureGitignored(repoRoot: string): StepOutcome {
+  const gitignorePath = join(repoRoot, ".gitignore");
+  const existing = existsSync(gitignorePath) ? readFileSync(gitignorePath, "utf8") : "";
+  const alreadyIgnored = existing.split("\n").some((line) => [LEDGER_DIRECTORY, `${LEDGER_DIRECTORY}/`, `/${LEDGER_DIRECTORY}`, `/${LEDGER_DIRECTORY}/`].includes(line.trim()));
+  if (alreadyIgnored) return "already-present";
+  const separator = existing === "" || existing.endsWith("\n") ? "" : "\n";
+  writeFileSync(gitignorePath, `${existing}${separator}${LEDGER_DIRECTORY}/\n`, "utf8");
+  return "added";
+}
+
+function describe(outcome: StepOutcome, addedText: string, presentText: string): string {
+  return outcome === "added" ? `  added    ${addedText}` : `  ok       ${presentText}`;
+}
+
+export function runInit(argv: readonly string[]): number {
+  if (argv.length > 0) {
+    process.stderr.write("usage: codeprov init\n");
+    return 2;
+  }
+  let repoRoot: string;
+  try {
+    repoRoot = git(process.cwd(), ["rev-parse", "--show-toplevel"]).trim();
+  } catch {
+    process.stderr.write("codeprov init must run inside a git repository\n");
+    return 2;
+  }
+
+  const lines: string[] = [`Setting up codeprov in ${repoRoot}`, ""];
+  try {
+    lines.push(describe(installClaudeHooks(repoRoot), `Claude Code capture hooks to ${CLAUDE_SETTINGS_FILE}`, `Claude Code capture hooks in ${CLAUDE_SETTINGS_FILE}`));
+    const prePush = installPrePushHook(repoRoot);
+    const hookLocation = relative(repoRoot, prePush.path) || prePush.path;
+    lines.push(describe(prePush.outcome, `git pre-push hook that shares provenance (${hookLocation})`, `git pre-push hook (${hookLocation})`));
+    lines.push(describe(ensureGitignored(repoRoot), `${LEDGER_DIRECTORY}/ to .gitignore`, `${LEDGER_DIRECTORY}/ is gitignored`));
+    lines.push(`  ok       this clone shares provenance as refs/codeprov/ledgers/${cloneId(repoRoot)}`);
+  } catch (error) {
+    process.stderr.write(`${(error as Error).message}\n`);
+    return 1;
+  }
+
+  lines.push(
+    "",
+    "Done. Keep working as usual:",
+    "  - Claude Code edits are recorded locally in .ai-provenance/ (never committed).",
+    "  - Every git push also pushes that record for files you have committed, so CI can read it.",
+    "",
+    `Commit ${CLAUDE_SETTINGS_FILE} so teammates capture too; each of them runs \`codeprov init\` once.`,
+    "",
+    "To get the check on pull requests, add one step after your tests in GitHub Actions:",
+    "",
+    "      - uses: Abhi0906/codeprov@main",
+    "        with:",
+    "          coverage: coverage/lcov.info",
+    "",
+    "Run `codeprov status` any time to see what is recorded and shared.",
+  );
+  process.stdout.write(`${lines.join("\n")}\n`);
+  return 0;
+}
+
+export function removeHookBlock(script: string): string | null {
+  const start = script.indexOf(HOOK_BLOCK_START);
+  const end = script.indexOf(HOOK_BLOCK_END);
+  if (start === -1 || end === -1 || end < start) return script;
+  const withoutBlock = script.slice(0, start) + script.slice(end + HOOK_BLOCK_END.length).replace(/^\n/, "");
+  const meaningful = withoutBlock.split("\n").filter((line) => line.trim() !== "" && !line.startsWith("#!"));
+  return meaningful.length === 0 ? null : withoutBlock;
+}
+
+export function removeClaudeHooks(repoRoot: string): boolean {
+  const settingsPath = join(repoRoot, CLAUDE_SETTINGS_FILE);
+  if (!existsSync(settingsPath)) return false;
+  const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as { hooks?: Record<string, HookEntry[]> } & Record<string, unknown>;
+  if (settings.hooks === undefined) return false;
+  let changed = false;
+  for (const [event, entries] of Object.entries(settings.hooks)) {
+    const kept = entries
+      .map((entry) => ({ ...entry, hooks: (entry.hooks ?? []).filter((hook) => hook.command !== CAPTURE_COMMAND) }))
+      .filter((entry) => entry.hooks.length > 0);
+    if (kept.length !== entries.length || kept.some((entry, index) => entry.hooks.length !== (entries[index]?.hooks ?? []).length)) changed = true;
+    if (kept.length === 0) delete settings.hooks[event];
+    else settings.hooks[event] = kept;
+  }
+  if (!changed) return false;
+  if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+  writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  return true;
+}
+
+export function runUninstall(argv: readonly string[]): number {
+  if (argv.length > 0) {
+    process.stderr.write("usage: codeprov uninstall\n");
+    return 2;
+  }
+  let repoRoot: string;
+  try {
+    repoRoot = git(process.cwd(), ["rev-parse", "--show-toplevel"]).trim();
+  } catch {
+    process.stderr.write("codeprov uninstall must run inside a git repository\n");
+    return 2;
+  }
+  const lines = [`Removing codeprov hooks from ${repoRoot}`, ""];
+  try {
+    lines.push(removeClaudeHooks(repoRoot) ? `  removed  Claude Code capture hooks from ${CLAUDE_SETTINGS_FILE}` : "  ok       no Claude Code capture hooks to remove");
+  } catch (error) {
+    process.stderr.write(`${CLAUDE_SETTINGS_FILE} could not be read, so it was left untouched: ${(error as Error).message}\n`);
+    return 1;
+  }
+  const hookPath = prePushHookPath(repoRoot);
+  if (existsSync(hookPath) && readFileSync(hookPath, "utf8").includes(HOOK_BLOCK_START)) {
+    const remaining = removeHookBlock(readFileSync(hookPath, "utf8"));
+    if (remaining === null) rmSync(hookPath);
+    else writeFileSync(hookPath, remaining, "utf8");
+    lines.push(`  removed  codeprov from the git pre-push hook`);
+  } else {
+    lines.push("  ok       no git pre-push hook to remove");
+  }
+  lines.push(
+    "",
+    "Recorded data was kept. To delete it too:",
+    `  rm -rf ${LEDGER_DIRECTORY}`,
+    `  git push origin --delete refs/codeprov/ledgers/${cloneId(repoRoot)}`,
+  );
+  process.stdout.write(`${lines.join("\n")}\n`);
+  return 0;
+}

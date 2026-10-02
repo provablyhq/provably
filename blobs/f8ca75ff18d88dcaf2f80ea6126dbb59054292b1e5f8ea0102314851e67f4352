@@ -1,0 +1,64 @@
+#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+import { runInit } from "./init.js";
+import { runStatus } from "./status.js";
+import { runSync } from "./sync-cli.js";
+import { runCheck } from "./check-cli.js";
+import { runCaptureHook } from "./capture-hook.js";
+import { runReport } from "./provenance-report.js";
+import { runLedger } from "./ledger-cli.js";
+import { isMainModule } from "./entry.js";
+
+const HELP = `codeprov: flag AI-authored lines in a pull request that no test executes
+
+Setup (once per clone):
+  codeprov init                    install the Claude Code capture hooks and the git pre-push hook
+  codeprov status                  show what is installed, recorded and shared
+
+Pull request check:
+  codeprov check --base <rev> --coverage <report> [--fetch origin] [--json <path>]
+
+Other:
+  codeprov sync [--remote origin]  share provenance now (the pre-push hook does this for you)
+  codeprov report <file> [rev]     show which lines of a file are AI-authored
+  codeprov ledger <validate|show> <path>
+  codeprov capture                 the Claude Code hook itself (reads the hook payload on stdin)
+`;
+
+const COMMANDS: Record<string, (argv: readonly string[]) => number> = {
+  init: runInit,
+  status: runStatus,
+  sync: runSync,
+  check: runCheck,
+  capture: () => runCaptureHook(),
+  report: runReport,
+  ledger: runLedger,
+};
+
+function packageVersion(): string {
+  try {
+    return (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version;
+  } catch {
+    return "unknown";
+  }
+}
+
+export function runCli(argv: readonly string[]): number {
+  const [command, ...rest] = argv;
+  if (command === undefined || command === "help" || command === "--help" || command === "-h") {
+    process.stdout.write(HELP);
+    return command === undefined ? 2 : 0;
+  }
+  if (command === "--version" || command === "-v") {
+    process.stdout.write(`${packageVersion()}\n`);
+    return 0;
+  }
+  const handler = COMMANDS[command];
+  if (handler === undefined) {
+    process.stderr.write(`unknown command: ${command}\n\n${HELP}`);
+    return 2;
+  }
+  return handler(rest);
+}
+
+if (isMainModule(import.meta.url)) process.exit(runCli(process.argv.slice(2)));

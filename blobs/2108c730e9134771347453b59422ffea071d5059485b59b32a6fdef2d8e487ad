@@ -1,0 +1,102 @@
+import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { parseLedger, hashContent, labelsFromRanges, effectiveAiRanges, type LedgerEvent } from "./ledger.js";
+import { tokenize } from "./tokenize.js";
+import { rollupByLine, type LineProvenance } from "./lines.js";
+import { resolveFileProvenanceFromHistory } from "./resolve.js";
+import { snapshotReaderForRepo } from "./snapshot-store.js";
+import { isMainModule } from "./entry.js";
+
+function repoRoot(startDir: string): string {
+  try {
+    return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: startDir, encoding: "utf8" }).trim();
+  } catch {
+    return startDir;
+  }
+}
+
+function printLines(lines: readonly LineProvenance[], summary: string): number {
+  let aiLineCount = 0;
+  let nonEmptyLineCount = 0;
+  for (const line of lines) {
+    if (line.totalTokenCount > 0) nonEmptyLineCount++;
+    const isAiLine = line.aiRatio > 0;
+    if (isAiLine) aiLineCount++;
+    process.stdout.write(`${String(line.lineNumber).padStart(4)}  ${isAiLine ? "AI " : "   "} ${line.text}\n`);
+  }
+  process.stdout.write(`\n${aiLineCount}/${nonEmptyLineCount} non-empty lines AI-authored  ${summary}\n`);
+  return 0;
+}
+
+function reportExactAnchor(content: string, anchor: LedgerEvent): number {
+  const labels = labelsFromRanges(content, effectiveAiRanges(anchor));
+  const tokens = tokenize(content).map((token, index) => ({ ...token, ai: labels[index]! }));
+  const lines = rollupByLine(content, tokens);
+  return printLines(lines, `(exact anchor ${anchor.id}, ${anchor.ts})`);
+}
+
+function reportFromHistory(root: string, rev: string, file: string, events: readonly LedgerEvent[]): number {
+  let resolved;
+  try {
+    resolved = resolveFileProvenanceFromHistory(root, rev, file, events, { snapshotFor: snapshotReaderForRepo(root) });
+  } catch {
+    process.stderr.write(`cannot read ${file} at ${rev} from git history\n`);
+    return 1;
+  }
+  if (resolved.anchorCommit === null) {
+    process.stderr.write(
+      `no anchored version of ${file} is reachable from ${rev}.\n` +
+        "No committed blob matches a ledger event, so provenance cannot be established.\n",
+    );
+    return 1;
+  }
+  const shortCommit = resolved.anchorCommit.slice(0, 10);
+  const anchorDescription = resolved.anchorKind === "reanchored" ? "re-anchored from a capture snapshot" : "exact anchor";
+  return printLines(
+    resolved.lines,
+    `(git-history from ${rev}, ${anchorDescription} at ${shortCommit}, git-vetoed)`,
+  );
+}
+
+export function runReport(argv: readonly string[]): number {
+  const target = argv[0];
+  if (!target) {
+    process.stderr.write("usage: provenance-report <file> [rev]\n");
+    return 2;
+  }
+  const requestedRev = argv[1];
+
+  const absolute = isAbsolute(target) ? target : resolve(process.cwd(), target);
+  const root = repoRoot(dirname(absolute));
+  const file = relative(root, absolute);
+  const ledgerPath = join(root, ".ai-provenance", "ledger.jsonl");
+
+  let events: LedgerEvent[];
+  try {
+    events = parseLedger(readFileSync(ledgerPath, "utf8"));
+  } catch {
+    process.stderr.write(`no readable ledger at ${ledgerPath}\n`);
+    return 2;
+  }
+
+  const forFile = events.filter((event) => event.file === file);
+  if (forFile.length === 0) {
+    process.stderr.write(`no ledger events for ${file}\n`);
+    return 1;
+  }
+
+  if (requestedRev !== undefined) {
+    return reportFromHistory(root, requestedRev, file, events);
+  }
+
+  const content = readFileSync(absolute, "utf8");
+  const anchor = [...forFile].reverse().find((event) => event.contentSha256 === hashContent(content));
+  if (anchor !== undefined) {
+    return reportExactAnchor(content, anchor);
+  }
+
+  return reportFromHistory(root, "HEAD", file, events);
+}
+
+if (isMainModule(import.meta.url)) process.exit(runReport(process.argv.slice(2)));

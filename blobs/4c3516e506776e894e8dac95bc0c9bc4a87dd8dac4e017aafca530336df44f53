@@ -1,0 +1,88 @@
+# provably
+
+Flags the lines an AI wrote in a pull request that no test executes. Warn-only: it annotates the PR and never fails the build.
+
+It knows which lines the AI wrote because it records them at the moment Claude Code writes them, not by guessing from style. A line is flagged only when that record, git blame and your coverage report all agree. Anything uncertain is left out.
+
+## Setup
+
+Once per developer:
+
+```sh
+npm install -g github:Abhi0906/codeprov
+```
+
+Once per clone, inside the repository:
+
+```sh
+provably init
+```
+
+That is the whole local setup. It:
+
+- adds the capture hooks to `.claude/settings.json` (existing settings and hooks are kept)
+- adds two lines to your git `pre-push` hook (works with plain hooks, `core.hooksPath` and husky)
+- adds `.ai-provenance/` to `.gitignore`
+
+Commit `.claude/settings.json` so the whole team captures. Teammates without provably installed are unaffected; the hook does nothing for them.
+
+## Pull request check
+
+Add one step after your tests in GitHub Actions:
+
+```yaml
+      - run: npm test -- --coverage
+      - uses: Abhi0906/codeprov@main
+        with:
+          coverage: coverage/lcov.info
+```
+
+The step runs only on pull requests. It posts annotations on the changed lines and a summary table on the run page, using the job's own output, so there is no app to install and no token to configure. Coverage can be lcov (Jest, Vitest, c8, nyc), Cobertura XML (coverage.py, JaCoCo converters, coverlet) or coverage.py JSON. List several reports separated by spaces.
+
+## Your workflow does not change
+
+| You do | provably does |
+|---|---|
+| Work with Claude Code as usual | Records which characters Claude wrote, about 40ms per edit, in `.ai-provenance/` |
+| Edit, reformat, amend, rebase, squash | Carries those records forward. Human changes stay human |
+| `git push` | Also pushes the record for files you committed, to `refs/provably/ledgers/<clone-id>` on the same remote |
+| Open a pull request | CI reads every teammate's record and annotates untested AI-written lines, highest risk first |
+
+## What is shared, and what is not
+
+- Shared: records for files tracked in git, plus snapshots of those files at the moments Claude edited them. They go only to the remote you push to, which already holds the code.
+- Never shared: edits to untracked or gitignored files (such as `.env`), and snapshots no shared record refers to.
+- Snapshots can include intermediate versions of tracked files that were never committed. If a secret was ever typed into a tracked file during an AI edit, it is in those snapshots. Run `provably uninstall` and delete the ref (see below) to remove everything.
+
+## Commands
+
+```
+provably init        set up this clone
+provably status      what is installed, recorded and shared
+provably uninstall   remove the hooks again (restores your settings and hook exactly)
+provably check       run the pull request check locally
+provably report      show which lines of a file are AI-authored
+provably sync        share the record now (the pre-push hook does this for you)
+```
+
+To also delete the recorded data after uninstalling:
+
+```sh
+rm -rf .ai-provenance
+git push origin --delete refs/provably/ledgers/$(git config provably.id)
+```
+
+## Risk ordering
+
+Findings that touch payments, auth, security, migrations or infrastructure come first, and each one says why: for example "line 12 uses `stripeClient.charges.create` from `stripe`". To name your own sensitive paths, add `.provably.json`:
+
+```json
+{ "risk": { "areas": { "payments": ["src/orders/**"] }, "notRisky": ["src/auth/labels.ts"] } }
+```
+
+## How it works
+
+- `docs/capture-hook.md`: how edits are recorded, including Bash commands
+- `docs/propagation.md`: how records survive edits, rebases and squashes, with the benchmark results
+- `docs/pr-check.md`: what gets flagged, coverage formats and risk evidence
+- `docs/ledger-spec.md`: the record format

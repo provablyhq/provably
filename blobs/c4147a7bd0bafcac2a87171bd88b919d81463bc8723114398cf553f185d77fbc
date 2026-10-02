@@ -1,0 +1,61 @@
+import { SimulatedRepo, deltaOnlyLedger } from "./history-sim.js";
+import { resolveFileProvenanceFromHistory } from "./resolve.js";
+import { emptyTotals, accumulateLineCounts, type GradeTotals } from "./grader.js";
+import type { LedgerEvent } from "./ledger.js";
+import type { ChainMethod } from "./chain.js";
+import type { HistoryScenario } from "./history-scenarios.js";
+
+export interface HistoryScenarioResult {
+  readonly name: string;
+  readonly deltaOnly: GradeTotals;
+  readonly chained: GradeTotals;
+  readonly chainMethods: readonly ChainMethod[];
+}
+
+export function gradeHistoryScenario(scenario: HistoryScenario): HistoryScenarioResult {
+  const repo = new SimulatedRepo();
+  try {
+    scenario.run(repo);
+    repo.assertModelMatchesDisk();
+    return {
+      name: scenario.name,
+      deltaOnly: gradeHead(repo, deltaOnlyLedger(repo.events)),
+      chained: gradeHead(repo, repo.events),
+      chainMethods: [...repo.chainMethods],
+    };
+  } finally {
+    repo.dispose();
+  }
+}
+
+function gradeHead(repo: SimulatedRepo, events: readonly LedgerEvent[]): GradeTotals {
+  const totals = emptyTotals();
+  for (const file of repo.trackedFiles()) {
+    const predicted = resolveFileProvenanceFromHistory(repo.dir, "HEAD", file, events).lines;
+    accumulateLineCounts(totals, predicted, repo.truthLines(file));
+  }
+  return totals;
+}
+
+export function gradeAllHistory(scenarios: readonly HistoryScenario[]): {
+  results: HistoryScenarioResult[];
+  deltaOnly: GradeTotals;
+  chained: GradeTotals;
+} {
+  const results = scenarios.map(gradeHistoryScenario);
+  const deltaOnly = emptyTotals();
+  const chained = emptyTotals();
+  for (const result of results) {
+    mergeLineCounts(deltaOnly, result.deltaOnly);
+    mergeLineCounts(chained, result.chained);
+  }
+  return { results, deltaOnly, chained };
+}
+
+function mergeLineCounts(target: GradeTotals, source: GradeTotals): void {
+  target.pureHumanLines += source.pureHumanLines;
+  target.pureHumanLinesFlagged += source.pureHumanLinesFlagged;
+  target.aiLineTruePositive += source.aiLineTruePositive;
+  target.aiLineFalsePositive += source.aiLineFalsePositive;
+  target.aiLineFalseNegative += source.aiLineFalseNegative;
+}

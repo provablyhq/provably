@@ -1,0 +1,202 @@
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { randomUUID, createHash } from "node:crypto";
+import { git, gitWithInput } from "./git.js";
+import { hashContent, parseLedger, serializeEvent, type LedgerEvent } from "./ledger.js";
+import { LEDGER_DIRECTORY, SNAPSHOT_DIRECTORY, readSnapshot } from "./snapshot-store.js";
+
+export const LEDGER_FILE = "ledger.jsonl";
+export const LEDGER_REF_PREFIX = "refs/codeprov/ledgers/";
+export const PUSHED_REF_PREFIX = "refs/codeprov/pushed/";
+export const LEDGER_FETCH_REFSPEC = `+${LEDGER_REF_PREFIX}*:${LEDGER_REF_PREFIX}*`;
+
+const CLONE_ID_CONFIG_KEY = "codeprov.id";
+const LEDGER_COMMIT_IDENTITY = {
+  GIT_AUTHOR_NAME: "codeprov",
+  GIT_AUTHOR_EMAIL: "codeprov@localhost",
+  GIT_COMMITTER_NAME: "codeprov",
+  GIT_COMMITTER_EMAIL: "codeprov@localhost",
+};
+
+export function parseLedgerLenient(jsonl: string): LedgerEvent[] {
+  const events: LedgerEvent[] = [];
+  for (const line of jsonl.split("\n")) {
+    if (line.trim() === "") continue;
+    try {
+      events.push(...parseLedger(line));
+    } catch {
+      continue;
+    }
+  }
+  return events;
+}
+
+export function cloneId(repoDir: string): string {
+  try {
+    const existing = git(repoDir, ["config", "--local", "--get", CLONE_ID_CONFIG_KEY]).trim();
+    if (existing !== "") return existing;
+  } catch {
+    // no id configured yet
+  }
+  const created = randomUUID();
+  git(repoDir, ["config", "--local", CLONE_ID_CONFIG_KEY, created]);
+  return created;
+}
+
+export function ledgerRefFor(repoDir: string): string {
+  return `${LEDGER_REF_PREFIX}${cloneId(repoDir)}`;
+}
+
+function shareableFiles(repoDir: string): Set<string> {
+  const files = new Set<string>();
+  const listings: string[][] = [["ls-files", "-z"], ["ls-tree", "-r", "-z", "--name-only", "HEAD"]];
+  for (const args of listings) {
+    try {
+      for (const path of git(repoDir, ["-c", "core.quotePath=false", ...args]).split("\0")) if (path !== "") files.add(path);
+    } catch {
+      continue;
+    }
+  }
+  return files;
+}
+
+function revParse(repoDir: string, rev: string): string | null {
+  try {
+    return git(repoDir, ["rev-parse", "--verify", "--quiet", rev]).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+export interface LedgerCommit {
+  readonly commit: string;
+  readonly ref: string;
+  readonly eventCount: number;
+  readonly snapshotCount: number;
+  readonly skippedEventCount: number;
+}
+
+export function commitLocalLedger(repoDir: string): LedgerCommit | null {
+  const ledgerDirectory = join(repoDir, LEDGER_DIRECTORY);
+  const ledgerPath = join(ledgerDirectory, LEDGER_FILE);
+  if (!existsSync(ledgerPath)) return null;
+  const allEvents = parseLedgerLenient(readFileSync(ledgerPath, "utf8"));
+  const shareable = shareableFiles(repoDir);
+  const events = allEvents.filter((event) => shareable.has(event.file));
+  if (events.length === 0) return null;
+
+  const snapshotHashes = [...new Set(events.map((event) => event.contentSha256))].filter((contentSha256) =>
+    existsSync(join(ledgerDirectory, SNAPSHOT_DIRECTORY, contentSha256)),
+  );
+  const ledgerBlob = gitWithInput(repoDir, ["hash-object", "-w", "--stdin"], events.map(serializeEvent).join("\n") + "\n").trim();
+  const rootEntries = [`100644 blob ${ledgerBlob}\t${LEDGER_FILE}`];
+  if (snapshotHashes.length > 0) {
+    const snapshotPaths = snapshotHashes.map((contentSha256) => join(ledgerDirectory, SNAPSHOT_DIRECTORY, contentSha256));
+    const snapshotBlobs = gitWithInput(repoDir, ["hash-object", "-w", "--stdin-paths"], snapshotPaths.join("\n") + "\n")
+      .trim()
+      .split("\n");
+    const snapshotEntries = snapshotHashes.map((contentSha256, index) => `100644 blob ${snapshotBlobs[index]}\t${contentSha256}`);
+    const snapshotTree = gitWithInput(repoDir, ["mktree"], snapshotEntries.join("\n") + "\n").trim();
+    rootEntries.push(`040000 tree ${snapshotTree}\t${SNAPSHOT_DIRECTORY}`);
+  }
+  const tree = gitWithInput(repoDir, ["mktree"], rootEntries.join("\n") + "\n").trim();
+
+  const ref = ledgerRefFor(repoDir);
+  const existingCommit = revParse(repoDir, ref);
+  const existingTree = existingCommit === null ? null : revParse(repoDir, `${existingCommit}^{tree}`);
+  let commit = existingCommit;
+  if (existingCommit === null || existingTree !== tree) {
+    commit = git(repoDir, ["commit-tree", tree, "-m", "codeprov ledger"], { ...process.env, ...LEDGER_COMMIT_IDENTITY }).trim();
+    git(repoDir, ["update-ref", ref, commit]);
+  }
+  return {
+    commit: commit!,
+    ref,
+    eventCount: events.length,
+    snapshotCount: snapshotHashes.length,
+    skippedEventCount: allEvents.length - events.length,
+  };
+}
+
+export type SyncStatus = "no-ledger" | "up-to-date" | "pushed";
+
+export interface SyncResult {
+  readonly status: SyncStatus;
+  readonly ledger: LedgerCommit | null;
+}
+
+function pushedRefFor(remote: string, ledgerRef: string): string {
+  const remoteKey = createHash("sha256").update(remote).digest("hex").slice(0, 16);
+  return `${PUSHED_REF_PREFIX}${remoteKey}/${ledgerRef.slice(LEDGER_REF_PREFIX.length)}`;
+}
+
+export function syncLedger(repoDir: string, remote: string): SyncResult {
+  const ledger = commitLocalLedger(repoDir);
+  if (ledger === null) return { status: "no-ledger", ledger: null };
+  const pushedRef = pushedRefFor(remote, ledger.ref);
+  if (revParse(repoDir, pushedRef) === ledger.commit) return { status: "up-to-date", ledger };
+  git(repoDir, ["push", "--force", "--no-verify", "--quiet", remote, `${ledger.ref}:${ledger.ref}`]);
+  git(repoDir, ["update-ref", pushedRef, ledger.commit]);
+  return { status: "pushed", ledger };
+}
+
+export function fetchLedgers(repoDir: string, remote: string): void {
+  git(repoDir, ["fetch", "--quiet", "--no-tags", remote, LEDGER_FETCH_REFSPEC]);
+}
+
+function ledgerRefs(repoDir: string): string[] {
+  return git(repoDir, ["for-each-ref", "--format=%(refname)", LEDGER_REF_PREFIX])
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+}
+
+export interface ProvenanceSource {
+  readonly events: readonly LedgerEvent[];
+  readonly snapshotFor: (contentSha256: string) => string | null;
+  readonly localEventCount: number;
+  readonly sharedLedgerCount: number;
+}
+
+export function loadProvenance(repoDir: string): ProvenanceSource {
+  const eventsById = new Map<string, LedgerEvent>();
+  const ledgerDirectory = join(repoDir, LEDGER_DIRECTORY);
+  const localLedgerPath = join(ledgerDirectory, LEDGER_FILE);
+  let localEventCount = 0;
+  if (existsSync(localLedgerPath)) {
+    for (const event of parseLedgerLenient(readFileSync(localLedgerPath, "utf8"))) {
+      eventsById.set(event.id, event);
+      localEventCount++;
+    }
+  }
+  const refs = ledgerRefs(repoDir);
+  for (const ref of refs) {
+    let jsonl: string;
+    try {
+      jsonl = git(repoDir, ["cat-file", "blob", `${ref}:${LEDGER_FILE}`]);
+    } catch {
+      continue;
+    }
+    for (const event of parseLedgerLenient(jsonl)) if (!eventsById.has(event.id)) eventsById.set(event.id, event);
+  }
+
+  const snapshotCache = new Map<string, string | null>();
+  const snapshotFor = (contentSha256: string): string | null => {
+    const cached = snapshotCache.get(contentSha256);
+    if (cached !== undefined) return cached;
+    let content = readSnapshot(ledgerDirectory, contentSha256);
+    for (const ref of refs) {
+      if (content !== null) break;
+      try {
+        const candidate = git(repoDir, ["cat-file", "blob", `${ref}:${SNAPSHOT_DIRECTORY}/${contentSha256}`]);
+        if (hashContent(candidate) === contentSha256) content = candidate;
+      } catch {
+        continue;
+      }
+    }
+    snapshotCache.set(contentSha256, content);
+    return content;
+  };
+
+  return { events: [...eventsById.values()], snapshotFor, localEventCount, sharedLedgerCount: refs.length };
+}

@@ -1,0 +1,145 @@
+import { execFileSync } from "node:child_process";
+
+export function git(repoDir: string, args: string[], environment?: NodeJS.ProcessEnv): string {
+  return execFileSync("git", args, {
+    cwd: repoDir,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+    ...(environment === undefined ? {} : { env: environment }),
+  });
+}
+
+export function gitWithInput(repoDir: string, args: string[], input: string, environment?: NodeJS.ProcessEnv): string {
+  return execFileSync("git", args, {
+    cwd: repoDir,
+    encoding: "utf8",
+    input,
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ["pipe", "pipe", "pipe"],
+    ...(environment === undefined ? {} : { env: environment }),
+  });
+}
+
+export function fileContentAtRev(repoDir: string, rev: string, file: string): string {
+  return git(repoDir, ["show", `${rev}:${file}`]);
+}
+
+export function commitsTouchingFile(repoDir: string, rev: string, file: string): string[] {
+  return git(repoDir, ["log", "--format=%H", rev, "--", file])
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+}
+
+export interface LineOrigin {
+  readonly commit: string;
+  readonly originalLine: number;
+}
+
+export function blameLineOrigins(repoDir: string, rev: string, file: string): LineOrigin[] {
+  const output = git(repoDir, ["blame", "--line-porcelain", rev, "--", file]);
+  const origins: LineOrigin[] = [];
+  let currentCommit = "";
+  let currentOriginalLine = 0;
+  for (const line of output.split("\n")) {
+    const header = /^([0-9a-f]{40}) (\d+) \d+/.exec(line);
+    if (header) {
+      currentCommit = header[1]!;
+      currentOriginalLine = Number(header[2]);
+    } else if (line.startsWith("\t")) {
+      origins.push({ commit: currentCommit, originalLine: currentOriginalLine });
+    }
+  }
+  return origins;
+}
+
+export function mergeBase(repoDir: string, baseRev: string, headRev: string): string {
+  return git(repoDir, ["merge-base", baseRev, headRev]).trim();
+}
+
+export function resolveCommit(repoDir: string, rev: string): string {
+  return git(repoDir, ["rev-parse", "--verify", `${rev}^{commit}`]).trim();
+}
+
+export function addedLinesBetween(repoDir: string, baseCommit: string, headCommit: string): Map<string, Set<number>> {
+  const output = git(repoDir, [
+    "-c",
+    "core.quotePath=false",
+    "diff",
+    "--no-color",
+    "--no-ext-diff",
+    "--unified=0",
+    "--find-renames",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    baseCommit,
+    headCommit,
+  ]);
+  return parseAddedLines(output);
+}
+
+export function parseAddedLines(unifiedDiff: string): Map<string, Set<number>> {
+  const addedLinesByFile = new Map<string, Set<number>>();
+  let currentFile: string | null = null;
+  for (const line of unifiedDiff.split("\n")) {
+    if (line.startsWith("+++ ")) {
+      const target = unquoteDiffPath(line.slice(4));
+      currentFile = target.startsWith("b/") ? target.slice(2) : null;
+      continue;
+    }
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
+    if (hunk === null || currentFile === null) continue;
+    const firstLine = Number(hunk[1]);
+    const lineCount = hunk[2] === undefined ? 1 : Number(hunk[2]);
+    if (lineCount === 0) continue;
+    let addedLines = addedLinesByFile.get(currentFile);
+    if (addedLines === undefined) {
+      addedLines = new Set();
+      addedLinesByFile.set(currentFile, addedLines);
+    }
+    for (let lineNumber = firstLine; lineNumber < firstLine + lineCount; lineNumber++) addedLines.add(lineNumber);
+  }
+  return addedLinesByFile;
+}
+
+function unquoteDiffPath(path: string): string {
+  const trimmed = path.replace(/\t$/, "");
+  if (!(trimmed.startsWith('"') && trimmed.endsWith('"'))) return trimmed;
+  const bytes: number[] = [];
+  const escapedCharacters: Record<string, number> = { n: 10, t: 9, r: 13, '"': 34, "\\": 92, a: 7, b: 8, f: 12, v: 11 };
+  const inner = trimmed.slice(1, -1);
+  for (let index = 0; index < inner.length; index++) {
+    const character = inner[index]!;
+    if (character !== "\\") {
+      bytes.push(...Buffer.from(character, "utf8"));
+      continue;
+    }
+    const octal = /^[0-7]{3}/.exec(inner.slice(index + 1));
+    if (octal !== null) {
+      bytes.push(parseInt(octal[0], 8));
+      index += 3;
+      continue;
+    }
+    const next = inner[index + 1] ?? "";
+    bytes.push(escapedCharacters[next] ?? next.charCodeAt(0));
+    index += 1;
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+export interface CommitTime {
+  readonly commit: string;
+  readonly authorTime: number;
+}
+
+export function commitTimesTouchingFile(repoDir: string, rev: string, file: string): CommitTime[] {
+  return git(repoDir, ["log", "--format=%H %at", rev, "--", file])
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "")
+    .map((line) => {
+      const [commit, authorTime] = line.split(" ");
+      return { commit: commit!, authorTime: Number(authorTime) };
+    });
+}

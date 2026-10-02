@@ -1,0 +1,51 @@
+{
+  "name": "provably",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Flags the lines an AI wrote in a pull request that no test executes, using provenance recorded when Claude Code writes them.",
+  "license": "Apache-2.0",
+  "author": "Abhishek Sharma",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/provablyhq/provably.git"
+  },
+  "keywords": [
+    "ai",
+    "provenance",
+    "code-coverage",
+    "claude-code",
+    "pull-request",
+    "github-actions",
+    "testing"
+  ],
+  "scripts": {
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "demo": "tsx src/demo.ts",
+    "grade": "tsx src/grade-report.ts",
+    "grade:git": "tsx src/grade-report-git.ts",
+    "grade:ledger": "tsx src/grade-report-ledger.ts",
+    "capture": "tsx src/capture-hook.ts",
+    "ledger": "tsx src/ledger-cli.ts",
+    "report": "tsx src/provenance-report.ts",
+    "grade:history": "tsx src/grade-report-history.ts",
+    "check": "tsx src/check-cli.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "cli": "tsx src/cli.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.7.0"
+  },
+  "bin": {
+    "provably": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ]
+}

@@ -1,0 +1,62 @@
+export type RiskTier = "high" | "standard";
+
+export interface PathRisk {
+  readonly tier: RiskTier;
+  readonly area: string | null;
+}
+
+const HIGH_RISK_AREAS: ReadonlyArray<readonly [area: string, words: readonly string[]]> = [
+  ["auth", ["auth", "authn", "authz", "oauth", "authentication", "authorization", "login", "logout", "signin", "signup", "session", "sessions", "password", "passwords", "credential", "credentials", "jwt", "sso", "saml", "oidc"]],
+  ["security", ["security", "crypto", "cryptography", "encrypt", "encryption", "decrypt", "secret", "secrets", "permission", "permissions", "acl", "rbac", "sanitize", "csrf", "xss"]],
+  ["payments", ["payment", "payments", "billing", "checkout", "invoice", "invoices", "stripe", "paypal", "subscription", "subscriptions", "refund", "refunds", "pricing", "charge", "charges", "wallet"]],
+  ["migrations", ["migration", "migrations", "migrate", "alembic", "flyway", "liquibase"]],
+  ["infra", ["infra", "infrastructure", "terraform", "deploy", "deployment", "deployments", "k8s", "kubernetes", "helm", "dockerfile", "ansible", "workflows", "cloudformation", "pulumi"]],
+];
+
+const HIGH_RISK_EXTENSIONS: ReadonlyArray<readonly [area: string, extension: string]> = [
+  ["infra", ".tf"],
+  ["infra", ".tfvars"],
+  ["migrations", ".sql"],
+];
+
+export function pathWords(path: string): string[] {
+  return path
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word !== "");
+}
+
+export function assessPathRisk(path: string): PathRisk {
+  const words = new Set(pathWords(path));
+  for (const [area, areaWords] of HIGH_RISK_AREAS) {
+    if (areaWords.some((word) => words.has(word))) return { tier: "high", area };
+  }
+  const lowerPath = path.toLowerCase();
+  for (const [area, extension] of HIGH_RISK_EXTENSIONS) {
+    if (lowerPath.endsWith(extension)) return { tier: "high", area };
+  }
+  return { tier: "standard", area: null };
+}
+
+const LOGIC_PATTERN = /\b(if|else|elif|for|while|switch|case|match|catch|except|throw|raise|return|await|yield)\b|&&|\|\||\s[<>]=?\s|[!=]==?|\?\?|\?\.|\bnot\b|\band\b|\bor\b/;
+
+export function isLogicLine(text: string): boolean {
+  return LOGIC_PATTERN.test(text);
+}
+
+export type FileRole = "source" | "test" | "other";
+
+const SOURCE_EXTENSIONS = new Set([
+  "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "go", "rb", "java", "kt", "kts", "rs", "cs", "php",
+  "swift", "scala", "c", "cc", "cpp", "h", "hpp", "m", "dart", "ex", "exs", "vue", "svelte", "sql", "tf",
+]);
+
+const TEST_PATH_PATTERN =
+  /(^|\/)(test|tests|__tests__|spec|specs|testing|fixtures|__mocks__)\/|\.(test|spec)\.[^/]+$|_test\.[^/]+$|(^|\/)test_[^/]+\.py$|(^|\/)conftest\.py$/;
+
+export function fileRole(path: string): FileRole {
+  const extension = /\.([^./]+)$/.exec(path)?.[1]?.toLowerCase();
+  if (extension === undefined || !SOURCE_EXTENSIONS.has(extension)) return "other";
+  return TEST_PATH_PATTERN.test(path) ? "test" : "source";
+}

@@ -1,0 +1,59 @@
+import { execFileSync } from "node:child_process";
+
+export function git(repoDir: string, args: string[], environment?: NodeJS.ProcessEnv): string {
+  return execFileSync("git", args, {
+    cwd: repoDir,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+    ...(environment === undefined ? {} : { env: environment }),
+  });
+}
+
+export function fileContentAtRev(repoDir: string, rev: string, file: string): string {
+  return git(repoDir, ["show", `${rev}:${file}`]);
+}
+
+export function commitsTouchingFile(repoDir: string, rev: string, file: string): string[] {
+  return git(repoDir, ["log", "--format=%H", rev, "--", file])
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+}
+
+export interface LineOrigin {
+  readonly commit: string;
+  readonly originalLine: number;
+}
+
+export function blameLineOrigins(repoDir: string, rev: string, file: string): LineOrigin[] {
+  const output = git(repoDir, ["blame", "--line-porcelain", rev, "--", file]);
+  const origins: LineOrigin[] = [];
+  let currentCommit = "";
+  let currentOriginalLine = 0;
+  for (const line of output.split("\n")) {
+    const header = /^([0-9a-f]{40}) (\d+) \d+/.exec(line);
+    if (header) {
+      currentCommit = header[1]!;
+      currentOriginalLine = Number(header[2]);
+    } else if (line.startsWith("\t")) {
+      origins.push({ commit: currentCommit, originalLine: currentOriginalLine });
+    }
+  }
+  return origins;
+}
+
+export interface CommitTime {
+  readonly commit: string;
+  readonly authorTime: number;
+}
+
+export function commitTimesTouchingFile(repoDir: string, rev: string, file: string): CommitTime[] {
+  return git(repoDir, ["log", "--format=%H %at", rev, "--", file])
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "")
+    .map((line) => {
+      const [commit, authorTime] = line.split(" ");
+      return { commit: commit!, authorTime: Number(authorTime) };
+    });
+}

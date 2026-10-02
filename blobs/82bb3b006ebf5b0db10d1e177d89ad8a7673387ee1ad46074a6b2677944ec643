@@ -1,0 +1,94 @@
+import { readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { join } from "node:path";
+import { parseLedger, type LedgerEvent } from "./ledger.js";
+import { mergeCoverageReports, parseCoverage, type CoverageReport } from "./coverage.js";
+import { snapshotReaderForRepo, LEDGER_DIRECTORY } from "./snapshot-store.js";
+import { analyzePullRequest, checkRunPayload } from "./pr-check.js";
+
+const USAGE =
+  "usage: check --base <rev> --coverage <report> [--coverage <report>...] [--head <rev>] [--json <output-path>]\n" +
+  "  reports may be lcov, cobertura XML or coverage.py JSON\n";
+
+interface CheckArguments {
+  readonly baseRev: string;
+  readonly headRev: string;
+  readonly coveragePaths: readonly string[];
+  readonly jsonOutputPath: string | null;
+}
+
+function parseArguments(argv: readonly string[]): CheckArguments | null {
+  let baseRev: string | null = null;
+  let headRev = "HEAD";
+  let jsonOutputPath: string | null = null;
+  const coveragePaths: string[] = [];
+  for (let index = 0; index < argv.length; index++) {
+    const flag = argv[index];
+    const value = argv[index + 1];
+    if (value === undefined) return null;
+    if (flag === "--base") baseRev = value;
+    else if (flag === "--head") headRev = value;
+    else if (flag === "--coverage") coveragePaths.push(value);
+    else if (flag === "--json") jsonOutputPath = value;
+    else return null;
+    index++;
+  }
+  if (baseRev === null || coveragePaths.length === 0) return null;
+  return { baseRev, headRev, coveragePaths, jsonOutputPath };
+}
+
+function repoRoot(): string {
+  return execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
+}
+
+function main(argv: readonly string[]): number {
+  const parsedArguments = parseArguments(argv);
+  if (parsedArguments === null) {
+    process.stderr.write(USAGE);
+    return 2;
+  }
+
+  const root = repoRoot();
+  const ledgerPath = join(root, LEDGER_DIRECTORY, "ledger.jsonl");
+  let events: LedgerEvent[];
+  try {
+    events = parseLedger(readFileSync(ledgerPath, "utf8"));
+  } catch (error) {
+    process.stderr.write(`no readable ledger at ${ledgerPath}: ${(error as Error).message}\n`);
+    return 2;
+  }
+
+  const reports: CoverageReport[] = [];
+  for (const coveragePath of parsedArguments.coveragePaths) {
+    try {
+      reports.push(parseCoverage(readFileSync(coveragePath, "utf8")));
+    } catch (error) {
+      process.stderr.write(`cannot read coverage report ${coveragePath}: ${(error as Error).message}\n`);
+      return 2;
+    }
+  }
+
+  const result = analyzePullRequest({
+    repoDir: root,
+    baseRev: parsedArguments.baseRev,
+    headRev: parsedArguments.headRev,
+    events,
+    coverage: mergeCoverageReports(reports),
+    resolveOptions: { snapshotFor: snapshotReaderForRepo(root) },
+  });
+  const payload = checkRunPayload(result);
+
+  process.stdout.write(`${payload.output.title}\n\n${payload.output.summary}\n`);
+  if (payload.output.annotations.length > 0) process.stdout.write("\nFindings, highest risk first:\n");
+  for (const annotation of payload.output.annotations) {
+    const lineSpan = annotation.start_line === annotation.end_line ? `${annotation.start_line}` : `${annotation.start_line}-${annotation.end_line}`;
+    process.stdout.write(`  [${annotation.annotation_level}] ${annotation.path}:${lineSpan}  ${annotation.message.replace(/\n/g, "  ")}\n`);
+  }
+
+  if (parsedArguments.jsonOutputPath !== null) {
+    writeFileSync(parsedArguments.jsonOutputPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  }
+  return 0;
+}
+
+process.exit(main(process.argv.slice(2)));

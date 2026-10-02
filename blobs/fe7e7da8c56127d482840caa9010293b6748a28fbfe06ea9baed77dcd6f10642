@@ -1,0 +1,46 @@
+export type RiskTier = "high" | "standard";
+
+export interface PathRisk {
+  readonly tier: RiskTier;
+  readonly area: string | null;
+}
+
+const HIGH_RISK_AREAS: ReadonlyArray<readonly [area: string, words: readonly string[]]> = [
+  ["auth", ["auth", "authn", "authz", "oauth", "authentication", "authorization", "login", "logout", "signin", "signup", "session", "sessions", "password", "passwords", "credential", "credentials", "jwt", "sso", "saml", "oidc"]],
+  ["security", ["security", "crypto", "cryptography", "encrypt", "encryption", "decrypt", "secret", "secrets", "permission", "permissions", "acl", "rbac", "sanitize", "csrf", "xss"]],
+  ["payments", ["payment", "payments", "billing", "checkout", "invoice", "invoices", "stripe", "paypal", "subscription", "subscriptions", "refund", "refunds", "pricing", "charge", "charges", "wallet", "ledger"]],
+  ["migrations", ["migration", "migrations", "migrate", "schema", "alembic", "flyway", "liquibase"]],
+  ["infra", ["infra", "infrastructure", "terraform", "deploy", "deployment", "deployments", "k8s", "kubernetes", "helm", "dockerfile", "ansible", "workflows", "cloudformation", "pulumi"]],
+];
+
+const HIGH_RISK_EXTENSIONS: ReadonlyArray<readonly [area: string, extension: string]> = [
+  ["infra", ".tf"],
+  ["infra", ".tfvars"],
+  ["migrations", ".sql"],
+];
+
+export function pathWords(path: string): string[] {
+  return path
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word !== "");
+}
+
+export function assessPathRisk(path: string): PathRisk {
+  const words = new Set(pathWords(path));
+  for (const [area, areaWords] of HIGH_RISK_AREAS) {
+    if (areaWords.some((word) => words.has(word))) return { tier: "high", area };
+  }
+  const lowerPath = path.toLowerCase();
+  for (const [area, extension] of HIGH_RISK_EXTENSIONS) {
+    if (lowerPath.endsWith(extension)) return { tier: "high", area };
+  }
+  return { tier: "standard", area: null };
+}
+
+const LOGIC_PATTERN = /\b(if|else|elif|for|while|switch|case|match|catch|except|throw|raise|return|await|yield)\b|&&|\|\||[<>]=?|[!=]==?|\?\?|\?\.|\bnot\b|\band\b|\bor\b/;
+
+export function isLogicLine(text: string): boolean {
+  return LOGIC_PATTERN.test(text);
+}

@@ -1,0 +1,52 @@
+name: codeprov
+description: Flag AI-authored lines added in a pull request that no test executes. Warn-only, never fails the build.
+branding:
+  icon: eye
+  color: purple
+inputs:
+  coverage:
+    description: Coverage report path(s) from your test step, separated by spaces or newlines. lcov, Cobertura XML and coverage.py JSON are detected automatically.
+    required: true
+  base:
+    description: Branch the pull request merges into.
+    required: false
+    default: ${{ github.base_ref }}
+runs:
+  using: composite
+  steps:
+    - name: Prepare history and shared provenance
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base }}
+        HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.clone_url }}
+      run: |
+        if [ -z "$BASE_BRANCH" ]; then
+          echo "codeprov: not a pull request, skipping"
+          exit 0
+        fi
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          git fetch --quiet --no-tags --unshallow origin
+        fi
+        git fetch --quiet --no-tags origin "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}"
+        git fetch --quiet --no-tags origin '+refs/codeprov/ledgers/*:refs/codeprov/ledgers/*' || true
+        if [ -n "$HEAD_REPOSITORY" ]; then
+          git fetch --quiet --no-tags "$HEAD_REPOSITORY" '+refs/codeprov/ledgers/*:refs/codeprov/ledgers/*' || true
+        fi
+    - name: Build codeprov
+      shell: bash
+      if: ${{ inputs.base != '' }}
+      run: |
+        cd "$GITHUB_ACTION_PATH"
+        npm ci --no-audit --no-fund --loglevel=error
+    - name: Check for untested AI-authored lines
+      shell: bash
+      if: ${{ inputs.base != '' }}
+      env:
+        BASE_BRANCH: ${{ inputs.base }}
+        COVERAGE_PATHS: ${{ inputs.coverage }}
+      run: |
+        coverage_arguments=()
+        for coverage_path in $COVERAGE_PATHS; do
+          coverage_arguments+=(--coverage "$coverage_path")
+        done
+        node "$GITHUB_ACTION_PATH/dist/cli.js" check --base "origin/${BASE_BRANCH}" "${coverage_arguments[@]}"

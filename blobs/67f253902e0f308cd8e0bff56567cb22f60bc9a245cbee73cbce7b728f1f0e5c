@@ -1,0 +1,72 @@
+export { tokenize, type Token } from "./tokenize.js";
+export { alignTokens, type AlignedPair } from "./lcs.js";
+export {
+  type CharRange,
+  type LedgerEvent,
+  hashContent,
+  parseLedger,
+  serializeEvent,
+  labelsFromRanges,
+  effectiveAiRanges,
+} from "./ledger.js";
+export {
+  propagateLabels,
+  type LabeledToken,
+  type PropagationResult,
+  type PropagationOptions,
+} from "./propagate.js";
+export { rollupByLine, type LineProvenance } from "./lines.js";
+export {
+  git,
+  fileContentAtRev,
+  commitsTouchingFile,
+  blameLineOrigins,
+  type LineOrigin,
+} from "./git.js";
+export {
+  anchoredAiLinesForFile,
+  vetoLines,
+  resolveFileProvenanceFromHistory,
+  type HistoryProvenance,
+} from "./resolve.js";
+export {
+  discoverAnchors,
+  gradeLedgerFile,
+  gradeLedger,
+  loadLedger,
+  survivalRecall,
+  type Anchor,
+  type SurvivalTotals,
+  type LedgerFileResult,
+  type LedgerGradeResult,
+} from "./grade-ledger.js";
+export {
+  aiRangesForWrite,
+  aiRangesForEdit,
+  aiRangesForMultiEdit,
+  aiRangesForToolCall,
+  normalizeRanges,
+  buildEvent,
+  type EditOperation,
+  type ToolCall,
+} from "./capture.js";
+export {
+  reverseEdits,
+  mapRangesThroughReplacement,
+  propagateRanges,
+  chainFileAiRanges,
+  buildChainedEvent,
+  type CaptureSnapshot,
+  type Replacement,
+  type ChainMethod,
+  type ChainResult,
+} from "./chain.js";
+export {
+  isHistoryCommand,
+  diffLines,
+  aiRangesForBashChange,
+  buildBashEvents,
+  type LineHunk,
+  type BashFileChange,
+} from "./bash-capture.js";
+export { snapshotWorktree, changedFilesBetween, fileInTree, type ChangedFile } from "./worktree-snapshot.js";

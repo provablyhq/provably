@@ -1,0 +1,76 @@
+# provably
+
+Finds the code Claude wrote in a pull request that no test runs, and points it out on the PR.
+
+It never guesses. It records which lines Claude writes at the moment it writes them, so a line is only flagged when provably knows the AI wrote it and your coverage report shows no test ran it. It only warns; it never fails a build.
+
+## How it works
+
+1. **You code with Claude Code as usual.** provably notes which lines Claude wrote. Lines you change yourself count as yours.
+2. **You `git push`.** That note goes along with the push, so CI can read it. It is stored out of sight: never in your branches, commits or PRs.
+3. **You open a pull request.** After your tests run, provably marks every Claude-written line in the PR that no test ran, riskiest first.
+
+## Setup
+
+Each developer, once (needs Node 22+, git and Claude Code):
+
+```sh
+npm install -g provably
+```
+
+In each repository you work in:
+
+```sh
+provably init
+```
+
+Commit the `.claude/settings.json` it creates so your whole team is covered. Teammates who have not installed provably are unaffected.
+
+Then add one step to your GitHub Actions workflow, after the tests:
+
+```yaml
+      - run: npm test -- --coverage
+      - uses: provablyhq/provably@v1
+        with:
+          coverage: coverage/lcov.info
+```
+
+That is all. No app to install and no token to configure. Works with lcov (Jest, Vitest, c8, nyc), Cobertura XML and coverage.py reports; list several separated by spaces.
+
+## Your data
+
+- Only notes about files committed to git are pushed, and only to the remote you push to, which already has your code.
+- Edits to untracked or ignored files (like `.env`) are never pushed.
+- The notes include copies of files as they were while Claude edited them, which can hold text that was never committed. If a secret was ever typed into a tracked file during an AI edit, it is in there. See [Remove](#remove) to delete everything.
+
+## Risky code first
+
+Findings in payments, auth, security, migrations or infrastructure are listed first, with the reason, for example "line 12 uses `stripeClient.charges.create` from `stripe`". To mark your own sensitive paths, add `.provably.json`:
+
+```json
+{ "risk": { "areas": { "payments": ["src/orders/**"] }, "notRisky": ["src/auth/labels.ts"] } }
+```
+
+## Commands
+
+```
+provably init        set up this repository
+provably status      show what is installed, recorded and pushed
+provably check       run the pull request check on your machine
+provably report      show which lines of a file Claude wrote
+provably uninstall   remove provably's hooks, restoring your files exactly
+```
+
+## Remove
+
+```sh
+provably uninstall
+rm -rf .ai-provenance
+git push origin --delete refs/provably/ledgers/$(git config provably.id)
+```
+
+The last two lines delete the recorded notes, on your machine and on the remote.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

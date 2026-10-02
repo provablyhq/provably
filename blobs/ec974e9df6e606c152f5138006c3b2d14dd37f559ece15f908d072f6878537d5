@@ -1,0 +1,232 @@
+import type { SimulatedRepo, HumanEdit } from "./history-sim.js";
+
+export interface HistoryScenario {
+  readonly name: string;
+  readonly run: (repo: SimulatedRepo) => void;
+}
+
+const SAMPLE = "sample.js";
+
+const humanBase = `export function parseInput(raw) {
+  const trimmed = raw.trim();
+  if (trimmed === "") {
+    return null;
+  }
+  return JSON.parse(trimmed);
+}
+
+export function formatOutput(value) {
+  return JSON.stringify(value, null, 2);
+}
+`;
+
+const formatOutputTail = "  return JSON.stringify(value, null, 2);\n}\n";
+
+const totalPriceFunction = `
+export function totalPrice(items) {
+  let total = 0;
+  for (const item of items) {
+    total += item.price * item.quantity;
+  }
+  return total;
+}
+`;
+
+const validateItemsFunction = `
+export function validateItems(items) {
+  if (!Array.isArray(items)) {
+    throw new TypeError("items must be an array");
+  }
+  return items.filter((item) => item.quantity > 0);
+}
+`;
+
+function startFromHumanBase(repo: SimulatedRepo): void {
+  repo.write("human", SAMPLE, humanBase);
+  repo.commit("human: base");
+}
+
+function aiAddsTotalPrice(repo: SimulatedRepo): void {
+  repo.edit("ai", SAMPLE, formatOutputTail, formatOutputTail + totalPriceFunction);
+}
+
+function aiAddsValidateItems(repo: SimulatedRepo): void {
+  repo.edit("ai", SAMPLE, "  return total;\n}\n", "  return total;\n}\n" + validateItemsFunction);
+}
+
+function aiChangesParseInput(repo: SimulatedRepo): void {
+  repo.edit("ai", SAMPLE, "  return JSON.parse(trimmed);\n", "  return JSON.parse(trimmed, reviveDates);\n");
+}
+
+const humanIndentOption: HumanEdit[] = [
+  { file: SAMPLE, oldString: "export function formatOutput(value) {", newString: "export function formatOutput(value, indent = 2) {" },
+  { file: SAMPLE, oldString: "JSON.stringify(value, null, 2)", newString: "JSON.stringify(value, null, indent)" },
+];
+
+function humanAddsIndentOption(repo: SimulatedRepo): void {
+  for (const edit of humanIndentOption) repo.edit("human", edit.file, edit.oldString, edit.newString);
+}
+
+function humanAppliesDiscount(repo: SimulatedRepo): void {
+  repo.edit(
+    "human",
+    SAMPLE,
+    "    total += item.price * item.quantity;\n",
+    "    total += item.price * item.quantity * (1 - item.discount);\n",
+  );
+}
+
+function humanAddsLookalikeFunction(repo: SimulatedRepo): void {
+  repo.edit(
+    "human",
+    SAMPLE,
+    "export function parseInput(raw) {\n",
+    "export function totalWeight(items) {\n  let total = 0;\n  for (const item of items) {\n    total += item.weight;\n  }\n  return total;\n}\n\nexport function parseInput(raw) {\n",
+  );
+}
+
+export const historyScenarios: HistoryScenario[] = [
+  {
+    name: "one AI edit, one commit",
+    run: (repo) => {
+      startFromHumanBase(repo);
+      aiAddsTotalPrice(repo);
+      repo.commit("ai: total price");
+    },
+  },
+  {
+    name: "three AI edits, one commit",
+    run: (repo) => {
+      startFromHumanBase(repo);
+      aiAddsTotalPrice(repo);
+      aiAddsValidateItems(repo);
+      aiChangesParseInput(repo);
+      repo.commit("ai: three edits");
+    },
+  },
+  {
+    name: "human edit between AI edits",
+    run: (repo) => {
+      startFromHumanBase(repo);
+      aiAddsTotalPrice(repo);
+      humanAddsIndentOption(repo);
+      aiAddsValidateItems(repo);
+      repo.commit("mixed");
+    },
+  },
+  {
+    name: "human modifies an AI line between AI edits",
+    run: (repo) => {
+      startFromHumanBase(repo);
+      aiAddsTotalPrice(repo);
+      humanAppliesDiscount(repo);
+      aiAddsValidateItems(repo);
+      repo.commit("mixed");
+    },
+  },
+  {
+    name: "human adds lookalike code between AI edits",
+    run: (repo) => {
+      startFromHumanBase(repo);
+      aiAddsTotalPrice(repo);
+      humanAddsLookalikeFunction(repo);
+      aiAddsValidateItems(repo);
+      repo.commit("mixed");
+    },
+  },
+  {
+    name: "human tweak after AI, before commit",
+    run: (repo) => {
+      startFromHumanBase(repo);
+      aiAddsTotalPrice(repo);
+      aiAddsValidateItems(repo);
+      humanAddsIndentOption(repo);
+      repo.commit("mixed");
+    },
+  },
+  {
+    name: "AI and human across separate commits",
+    run: (repo) => {
+      startFromHumanBase(repo);
+      aiAddsTotalPrice(repo);
+      repo.commit("ai: total price");
+      humanAddsIndentOption(repo);
+      repo.commit("human: indent");
+      aiAddsValidateItems(repo);
+      repo.commit("ai: validate");
+    },
+  },
+  {
+    name: "human amends the AI commit",
+    run: (repo) => {
+      startFromHumanBase(repo);
+      aiAddsTotalPrice(repo);
+      repo.commit("ai: total price");
+      humanAddsIndentOption(repo);
+      repo.amend();
+    },
+  },
+  {
+    name: "PR squashed to one commit",
+    run: (repo) => {
+      startFromHumanBase(repo);
+      const base = repo.head();
+      aiAddsTotalPrice(repo);
+      repo.commit("ai: total price");
+      humanAddsIndentOption(repo);
+      repo.commit("human: indent");
+      aiAddsValidateItems(repo);
+      repo.commit("ai: validate");
+      repo.squashSince(base, "squashed");
+    },
+  },
+  {
+    name: "rebase onto upstream that changed another file",
+    run: (repo) => {
+      startFromHumanBase(repo);
+      repo.createBranch("feature");
+      aiAddsTotalPrice(repo);
+      aiAddsValidateItems(repo);
+      repo.commit("ai: two edits");
+      repo.checkout("main");
+      repo.write("human", "other.js", "export const answer = 42;\n");
+      repo.commit("human: other file");
+      repo.checkout("feature");
+      repo.rebaseOnto("main", []);
+    },
+  },
+  {
+    name: "rebase onto upstream that changed the same file",
+    run: (repo) => {
+      startFromHumanBase(repo);
+      repo.createBranch("feature");
+      aiAddsTotalPrice(repo);
+      repo.commit("ai: total price");
+      repo.checkout("main");
+      const upstreamEdit: HumanEdit = {
+        file: SAMPLE,
+        oldString: "export function parseInput(raw) {",
+        newString: "export function parseInput(raw, options = {}) {",
+      };
+      repo.edit("human", upstreamEdit.file, upstreamEdit.oldString, upstreamEdit.newString);
+      repo.commit("human: options");
+      repo.checkout("feature");
+      repo.rebaseOnto("main", [upstreamEdit]);
+    },
+  },
+  {
+    name: "AI writes a new file, then edits it",
+    run: (repo) => {
+      startFromHumanBase(repo);
+      repo.write("ai", "pricing.js", `export function applyTax(amount, rate) {\n  return amount * (1 + rate);\n}\n`);
+      repo.edit("human", "pricing.js", "export function applyTax(amount, rate) {", "export function applyTax(amount, rate = 0.2) {");
+      repo.edit(
+        "ai",
+        "pricing.js",
+        "  return amount * (1 + rate);\n}\n",
+        "  return amount * (1 + rate);\n}\n\nexport function roundCents(amount) {\n  return Math.round(amount * 100) / 100;\n}\n",
+      );
+      repo.commit("ai: pricing");
+    },
+  },
+];

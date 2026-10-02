@@ -1,0 +1,285 @@
+import type { LedgerEvent } from "./ledger.js";
+import { addedLinesBetween, fileContentAtRev, git, mergeBase, resolveCommit } from "./git.js";
+import { isTypeScriptFile, typeOnlyLines } from "./type-only.js";
+import { resolveFileProvenanceFromHistory, type ResolveOptions } from "./resolve.js";
+import { alignCoverageToRepo, coverageForFile, type CoverageReport, type LineHits } from "./coverage.js";
+import {
+  EMPTY_RISK_CONFIG,
+  RISK_CONFIG_FILE,
+  fileRisk,
+  fileRiskContext,
+  fileRole,
+  findingRisk,
+  isLogicLine,
+  parseRiskConfig,
+  type FileRiskContext,
+  type RiskAssessment,
+  type RiskConfig,
+} from "./risk.js";
+
+export interface PullRequestCheckInput {
+  readonly repoDir: string;
+  readonly baseRev: string;
+  readonly headRev: string;
+  readonly events: readonly LedgerEvent[];
+  readonly coverage: CoverageReport;
+  readonly resolveOptions?: ResolveOptions;
+  readonly riskConfig?: RiskConfig;
+}
+
+export interface UncoveredAiFinding {
+  readonly file: string;
+  readonly startLine: number;
+  readonly endLine: number;
+  readonly uncoveredLineCount: number;
+  readonly logicLineCount: number;
+  readonly eventIds: readonly string[];
+  readonly risk: RiskAssessment;
+}
+
+export type FileCoverageStatus = "in-report" | "missing-from-report";
+
+export interface FileCheckSummary {
+  readonly file: string;
+  readonly addedLineCount: number;
+  readonly aiAddedLineCount: number;
+  readonly uncoveredAiLineCount: number;
+  readonly coverageStatus: FileCoverageStatus;
+  readonly risk: RiskAssessment;
+}
+
+export interface PullRequestCheckResult {
+  readonly baseCommit: string;
+  readonly headCommit: string;
+  readonly files: readonly FileCheckSummary[];
+  readonly findings: readonly UncoveredAiFinding[];
+}
+
+export function analyzePullRequest(input: PullRequestCheckInput): PullRequestCheckResult {
+  const headCommit = resolveCommit(input.repoDir, input.headRev);
+  const baseCommit = mergeBase(input.repoDir, input.baseRev, headCommit);
+  const filesWithEvents = new Set(input.events.map((event) => event.file));
+  const addedLinesByFile = addedLinesBetween(input.repoDir, baseCommit, headCommit);
+  const coverage = alignCoverageToRepo(input.coverage, trackedFilesAt(input.repoDir, headCommit));
+  const riskConfig = input.riskConfig ?? riskConfigAt(input.repoDir, headCommit);
+
+  const files: FileCheckSummary[] = [];
+  const findings: UncoveredAiFinding[] = [];
+  for (const [file, addedLines] of [...addedLinesByFile].sort(([left], [right]) => left.localeCompare(right))) {
+    if (!filesWithEvents.has(file) || fileRole(file) !== "source") continue;
+    const aiAddedLines = aiAddedLinesForFile(input, headCommit, file, addedLines);
+    if (aiAddedLines.size === 0) continue;
+
+    const headContent = fileContentAtRev(input.repoDir, headCommit, file);
+    const riskContext = fileRiskContext(file, headContent, riskConfig);
+    const lineHits = coverageForFile(coverage, file);
+    const fileFindings = lineHits === null ? [] : uncoveredFindings(file, headContent, aiAddedLines, lineHits, riskContext);
+    findings.push(...fileFindings);
+    files.push({
+      file,
+      addedLineCount: addedLines.size,
+      aiAddedLineCount: aiAddedLines.size,
+      uncoveredAiLineCount: fileFindings.reduce((sum, finding) => sum + finding.uncoveredLineCount, 0),
+      coverageStatus: lineHits === null ? "missing-from-report" : "in-report",
+      risk: fileFindings.find((finding) => finding.risk.tier === "high")?.risk ?? fileRisk(riskContext),
+    });
+  }
+  findings.sort(compareFindings);
+  return { baseCommit, headCommit, files, findings };
+}
+
+export function riskConfigAt(repoDir: string, commit: string): RiskConfig {
+  let json: string;
+  try {
+    json = fileContentAtRev(repoDir, commit, RISK_CONFIG_FILE);
+  } catch {
+    return EMPTY_RISK_CONFIG;
+  }
+  return parseRiskConfig(json);
+}
+
+function trackedFilesAt(repoDir: string, commit: string): string[] {
+  return git(repoDir, ["-c", "core.quotePath=false", "ls-tree", "-r", "-z", "--name-only", commit])
+    .split("\0")
+    .filter((path) => path !== "");
+}
+
+function aiAddedLinesForFile(
+  input: PullRequestCheckInput,
+  headCommit: string,
+  file: string,
+  addedLines: ReadonlySet<number>,
+): Map<number, string> {
+  let provenance;
+  try {
+    provenance = resolveFileProvenanceFromHistory(input.repoDir, headCommit, file, input.events, input.resolveOptions);
+  } catch {
+    return new Map();
+  }
+  const aiAddedLines = new Map<number, string>();
+  for (const line of provenance.lines) {
+    if (line.aiRatio === 0 || !addedLines.has(line.lineNumber)) continue;
+    const eventId = provenance.eventIdByLine.get(line.lineNumber);
+    if (eventId !== undefined) aiAddedLines.set(line.lineNumber, eventId);
+  }
+  return aiAddedLines;
+}
+
+function uncoveredFindings(
+  file: string,
+  headContent: string,
+  aiAddedLines: ReadonlyMap<number, string>,
+  lineHits: LineHits,
+  riskContext: FileRiskContext,
+): UncoveredAiFinding[] {
+  const lineTexts = headContent.split("\n");
+  const executableHits = withoutTypeOnlyLines(file, headContent, lineHits);
+  const uncoveredLines = [...aiAddedLines.keys()].filter((lineNumber) => executableHits.get(lineNumber) === 0).sort((left, right) => left - right);
+
+  const groups: number[][] = [];
+  for (const lineNumber of uncoveredLines) {
+    const currentGroup = groups[groups.length - 1];
+    const previousLine = currentGroup?.[currentGroup.length - 1];
+    if (currentGroup !== undefined && previousLine !== undefined && onlyNonExecutableBetween(previousLine, lineNumber, executableHits)) {
+      currentGroup.push(lineNumber);
+    } else {
+      groups.push([lineNumber]);
+    }
+  }
+
+  return groups.map((group) => ({
+    file,
+    startLine: group[0]!,
+    endLine: group[group.length - 1]!,
+    uncoveredLineCount: group.length,
+    logicLineCount: group.filter((lineNumber) => isLogicLine(lineTexts[lineNumber - 1] ?? "")).length,
+    eventIds: [...new Set(group.map((lineNumber) => aiAddedLines.get(lineNumber)!))],
+    risk: findingRisk(
+      riskContext,
+      group.map((lineNumber) => ({ lineNumber, text: lineTexts[lineNumber - 1] ?? "" })),
+    ),
+  }));
+}
+
+function withoutTypeOnlyLines(file: string, content: string, lineHits: LineHits): LineHits {
+  if (!isTypeScriptFile(file)) return lineHits;
+  const typeOnly = typeOnlyLines(content);
+  if (typeOnly.size === 0) return lineHits;
+  return new Map([...lineHits].filter(([lineNumber]) => !typeOnly.has(lineNumber)));
+}
+
+function onlyNonExecutableBetween(previousLine: number, nextLine: number, lineHits: LineHits): boolean {
+  for (let lineNumber = previousLine + 1; lineNumber < nextLine; lineNumber++) {
+    if (lineHits.has(lineNumber)) return false;
+  }
+  return true;
+}
+
+const TIER_ORDER: Record<RiskAssessment["tier"], number> = { high: 0, elevated: 1, standard: 2 };
+
+function compareFindings(left: UncoveredAiFinding, right: UncoveredAiFinding): number {
+  const tierOrder = (finding: UncoveredAiFinding) => TIER_ORDER[finding.risk.tier];
+  return (
+    tierOrder(left) - tierOrder(right) ||
+    right.logicLineCount - left.logicLineCount ||
+    right.uncoveredLineCount - left.uncoveredLineCount ||
+    left.file.localeCompare(right.file) ||
+    left.startLine - right.startLine
+  );
+}
+
+export interface CheckAnnotation {
+  readonly path: string;
+  readonly start_line: number;
+  readonly end_line: number;
+  readonly annotation_level: "notice" | "warning";
+  readonly title: string;
+  readonly message: string;
+}
+
+export interface CheckRunPayload {
+  readonly name: string;
+  readonly head_sha: string;
+  readonly status: "completed";
+  readonly conclusion: "success" | "neutral";
+  readonly output: {
+    readonly title: string;
+    readonly summary: string;
+    readonly annotations: readonly CheckAnnotation[];
+  };
+}
+
+export const CHECK_NAME = "codeprov: untested AI-authored code";
+
+export function checkRunPayload(result: PullRequestCheckResult): CheckRunPayload {
+  const uncoveredTotal = result.findings.reduce((sum, finding) => sum + finding.uncoveredLineCount, 0);
+  const title =
+    uncoveredTotal === 0
+      ? "No untested AI-authored lines"
+      : `${uncoveredTotal} AI-authored line${uncoveredTotal === 1 ? "" : "s"} not covered by tests`;
+  return {
+    name: CHECK_NAME,
+    head_sha: result.headCommit,
+    status: "completed",
+    conclusion: uncoveredTotal === 0 ? "success" : "neutral",
+    output: { title, summary: checkSummary(result), annotations: result.findings.map(annotationForFinding) },
+  };
+}
+
+function riskLabel(risk: RiskAssessment): string {
+  if (risk.tier === "high") return `high-risk area (${risk.area})`;
+  if (risk.tier === "elevated") return `possibly sensitive area (${risk.area})`;
+  return "";
+}
+
+function riskReasons(risk: RiskAssessment): string {
+  return risk.evidence
+    .slice(0, 3)
+    .map((evidence) => evidence.detail)
+    .join("; ");
+}
+
+function annotationForFinding(finding: UncoveredAiFinding): CheckAnnotation {
+  const lineWord = finding.uncoveredLineCount === 1 ? "line" : "lines";
+  const label = riskLabel(finding.risk);
+  const riskLine = label === "" ? "" : `Why ${label}: ${riskReasons(finding.risk)}.\n`;
+  return {
+    path: finding.file,
+    start_line: finding.startLine,
+    end_line: finding.endLine,
+    annotation_level: finding.risk.tier === "high" ? "warning" : "notice",
+    title: label === "" ? "Untested AI-authored code" : `Untested AI-authored code in a ${label}`,
+    message:
+      `${finding.uncoveredLineCount} AI-authored ${lineWord} added in this PR ${finding.uncoveredLineCount === 1 ? "is" : "are"} not executed by any test.\n` +
+      riskLine +
+      `Capture event${finding.eventIds.length === 1 ? "" : "s"}: ${finding.eventIds.join(", ")}`,
+  };
+}
+
+function checkSummary(result: PullRequestCheckResult): string {
+  const lines: string[] = [];
+  lines.push(`Compared \`${result.baseCommit.slice(0, 10)}\` (merge base) to \`${result.headCommit.slice(0, 10)}\`.`);
+  lines.push("");
+  lines.push("This check is warn-only. A line counts as AI-authored only when a capture event anchors it and git blame agrees; anything uncertain is left out.");
+  lines.push("");
+  if (result.files.length === 0) {
+    lines.push("No AI-authored lines were added in this PR.");
+    return lines.join("\n");
+  }
+  lines.push("| File | Added lines | AI-authored | AI and untested | Risk |");
+  lines.push("|---|---:|---:|---:|---|");
+  for (const file of result.files) {
+    const untested = file.coverageStatus === "missing-from-report" ? "not in report" : String(file.uncoveredAiLineCount);
+    const risk = file.risk.tier === "standard" ? "standard" : `${file.risk.tier} (${file.risk.area}): ${riskReasons(file.risk)}`;
+    lines.push(`| \`${file.file}\` | ${file.addedLineCount} | ${file.aiAddedLineCount} | ${untested} | ${risk} |`);
+  }
+  const missing = result.files.filter((file) => file.coverageStatus === "missing-from-report");
+  if (missing.length > 0) {
+    lines.push("");
+    lines.push(
+      `${missing.length} file${missing.length === 1 ? " has" : "s have"} AI-authored lines but no entry in the coverage report, so no lines there are flagged. ` +
+        "If these files should be tested, make sure the coverage run includes them.",
+    );
+  }
+  return lines.join("\n");
+}

@@ -1,0 +1,199 @@
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { git } from "./git.js";
+import { labelsFromRanges, type CharRange, type LedgerEvent } from "./ledger.js";
+import { commonPrefixLength, commonSuffixLength, type ToolCall } from "./capture.js";
+import { buildChainedEvent, type CaptureSnapshot, type ChainMethod } from "./chain.js";
+import { tokenize } from "./tokenize.js";
+import { rollupByLine, type LineProvenance } from "./lines.js";
+
+export type Actor = "ai" | "human";
+
+interface TrackedFile {
+  content: string;
+  truth: boolean[];
+}
+
+type Model = Map<string, TrackedFile>;
+
+export interface HumanEdit {
+  readonly file: string;
+  readonly oldString: string;
+  readonly newString: string;
+}
+
+export class SimulatedRepo {
+  readonly dir: string;
+  readonly events: LedgerEvent[] = [];
+  readonly chainMethods: ChainMethod[] = [];
+  private readonly snapshots = new Map<string, CaptureSnapshot>();
+  private readonly branchModels = new Map<string, Model>();
+  private currentBranch = "main";
+  private model: Model = new Map();
+  private eventCounter = 0;
+
+  constructor() {
+    this.dir = mkdtempSync(join(tmpdir(), "codeprov-history-"));
+    this.git(["init", "-q", "-b", "main"]);
+    this.git(["config", "user.email", "simulator@example.com"]);
+    this.git(["config", "user.name", "Simulator"]);
+    this.git(["config", "commit.gpgsign", "false"]);
+  }
+
+  git(args: string[]): string {
+    return git(this.dir, args);
+  }
+
+  dispose(): void {
+    rmSync(this.dir, { recursive: true, force: true });
+  }
+
+  write(actor: Actor, file: string, content: string): void {
+    this.model.set(file, { content, truth: new Array<boolean>(content.length).fill(actor === "ai") });
+    writeFileSync(join(this.dir, file), content);
+    if (actor === "ai") {
+      this.capture(file, content, { toolName: "Write", toolInput: { file_path: file, content } });
+    }
+  }
+
+  edit(actor: Actor, file: string, oldString: string, newString: string): void {
+    this.applyToModel(actor, { file, oldString, newString });
+    const content = this.model.get(file)!.content;
+    writeFileSync(join(this.dir, file), content);
+    if (actor === "ai") {
+      this.capture(file, content, {
+        toolName: "Edit",
+        toolInput: { file_path: file, old_string: oldString, new_string: newString },
+      });
+    }
+  }
+
+  commit(message: string): void {
+    this.git(["add", "-A"]);
+    this.git(["commit", "-q", "-m", message]);
+  }
+
+  amend(): void {
+    this.git(["add", "-A"]);
+    this.git(["commit", "-q", "--amend", "--no-edit"]);
+  }
+
+  squashSince(baseRev: string, message: string): void {
+    this.git(["reset", "-q", "--soft", baseRev]);
+    this.git(["commit", "-q", "-m", message]);
+  }
+
+  head(): string {
+    return this.git(["rev-parse", "HEAD"]).trim();
+  }
+
+  createBranch(name: string): void {
+    this.branchModels.set(this.currentBranch, cloneModel(this.model));
+    this.git(["checkout", "-q", "-b", name]);
+    this.currentBranch = name;
+  }
+
+  checkout(name: string): void {
+    this.branchModels.set(this.currentBranch, cloneModel(this.model));
+    this.git(["checkout", "-q", name]);
+    this.model = cloneModel(this.branchModels.get(name) ?? new Map());
+    this.currentBranch = name;
+  }
+
+  rebaseOnto(upstream: string, upstreamHumanEdits: readonly HumanEdit[], upstreamHumanWrites: readonly HumanEdit[] = []): void {
+    this.git(["rebase", "-q", upstream]);
+    for (const written of upstreamHumanWrites) {
+      if (!this.model.has(written.file)) {
+        this.model.set(written.file, {
+          content: written.newString,
+          truth: new Array<boolean>(written.newString.length).fill(false),
+        });
+      }
+    }
+    for (const edit of upstreamHumanEdits) this.applyToModel("human", edit);
+    this.assertModelMatchesDisk();
+  }
+
+  trackedFiles(): string[] {
+    return [...this.model.keys()].sort();
+  }
+
+  truthLines(file: string): LineProvenance[] {
+    const tracked = this.model.get(file)!;
+    const labels = labelsFromRanges(tracked.content, rangesFromTruth(tracked.truth));
+    const tokens = tokenize(tracked.content).map((token, index) => ({ ...token, ai: labels[index]! }));
+    return rollupByLine(tracked.content, tokens);
+  }
+
+  assertModelMatchesDisk(): void {
+    for (const [file, tracked] of this.model) {
+      const path = join(this.dir, file);
+      const onDisk = existsSync(path) ? readFileSync(path, "utf8") : "";
+      if (onDisk !== tracked.content) {
+        throw new Error(`Simulation model diverged from disk for ${file} on branch ${this.currentBranch}`);
+      }
+    }
+  }
+
+  private applyToModel(actor: Actor, edit: HumanEdit): void {
+    const tracked = this.model.get(edit.file);
+    if (!tracked) throw new Error(`Unknown file ${edit.file}`);
+    const start = tracked.content.indexOf(edit.oldString);
+    if (start === -1 || tracked.content.indexOf(edit.oldString, start + 1) !== -1) {
+      throw new Error(`Edit target must occur exactly once in ${edit.file}: ${JSON.stringify(edit.oldString)}`);
+    }
+    const prefix = commonPrefixLength(edit.oldString, edit.newString);
+    const suffix = commonSuffixLength(edit.oldString, edit.newString, prefix);
+    const changedLength = edit.newString.length - prefix - suffix;
+    tracked.content =
+      tracked.content.slice(0, start) + edit.newString + tracked.content.slice(start + edit.oldString.length);
+    tracked.truth = [
+      ...tracked.truth.slice(0, start + prefix),
+      ...new Array<boolean>(changedLength).fill(actor === "ai"),
+      ...tracked.truth.slice(start + edit.oldString.length - suffix),
+    ];
+  }
+
+  private capture(file: string, content: string, call: ToolCall): void {
+    this.eventCounter++;
+    const captured = buildChainedEvent({
+      call,
+      content,
+      file,
+      tool: "claude-code",
+      model: "simulated",
+      previous: this.snapshots.get(file) ?? null,
+      id: `event-${this.eventCounter}`,
+      ts: new Date(Date.UTC(2026, 9, 2, 0, 0, this.eventCounter)).toISOString(),
+    });
+    if (captured === null) return;
+    this.events.push(captured.event);
+    this.chainMethods.push(captured.method);
+    this.snapshots.set(file, { content, fileAiRanges: captured.event.fileAiRanges ?? captured.event.aiRanges });
+  }
+}
+
+export function deltaOnlyLedger(events: readonly LedgerEvent[]): LedgerEvent[] {
+  return events.map(({ fileAiRanges: _ignored, ...rest }) => rest);
+}
+
+function rangesFromTruth(truth: readonly boolean[]): CharRange[] {
+  const ranges: CharRange[] = [];
+  let start = -1;
+  for (let index = 0; index <= truth.length; index++) {
+    const isAi = index < truth.length && truth[index]!;
+    if (isAi && start === -1) start = index;
+    if (!isAi && start !== -1) {
+      ranges.push([start, index]);
+      start = -1;
+    }
+  }
+  return ranges;
+}
+
+function cloneModel(model: Model): Model {
+  const copy: Model = new Map();
+  for (const [file, tracked] of model) copy.set(file, { content: tracked.content, truth: [...tracked.truth] });
+  return copy;
+}

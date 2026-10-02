@@ -1,0 +1,230 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { git } from "./git.js";
+import {
+  CAPTURE_COMMAND,
+  HOOK_BLOCK_START,
+  ensureGitignored,
+  insertHookBlock,
+  installClaudeHooks,
+  prePushHookPath,
+  removeClaudeHooks,
+  removeHookBlock,
+} from "./init.js";
+import { LEDGER_REF_PREFIX, loadProvenance } from "./ledger-sync.js";
+import { stepSummaryMarkdown, workflowAnnotationCommands } from "./github-output.js";
+import type { CheckRunPayload } from "./pr-check.js";
+
+const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const cliSource = join(projectRoot, "src", "cli.ts");
+const tsxLoader = join(projectRoot, "node_modules", "tsx", "dist", "loader.mjs");
+
+function makeShim(directory: string): string {
+  const binDirectory = join(directory, "bin");
+  mkdirSync(binDirectory, { recursive: true });
+  const shimPath = join(binDirectory, "codeprov");
+  writeFileSync(shimPath, `#!/bin/sh\nexec "${process.execPath}" --import "${tsxLoader}" "${cliSource}" "$@"\n`);
+  chmodSync(shimPath, 0o755);
+  return binDirectory;
+}
+
+function run(cwd: string, pathPrefix: string, command: string, args: string[], input?: string): string {
+  return execFileSync(command, args, {
+    cwd,
+    encoding: "utf8",
+    input,
+    env: {
+      ...process.env,
+      PATH: `${pathPrefix}:${process.env.PATH}`,
+      GIT_AUTHOR_NAME: "Dev",
+      GIT_AUTHOR_EMAIL: "dev@example.com",
+      GIT_COMMITTER_NAME: "Dev",
+      GIT_COMMITTER_EMAIL: "dev@example.com",
+      GITHUB_ACTIONS: "",
+    },
+  });
+}
+
+test("developer workflow: init, Claude edits, plain git push, CI clone sees the provenance", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "codeprov-workflow-"));
+  try {
+    const binDirectory = makeShim(workspace);
+    const remote = join(workspace, "remote.git");
+    git(workspace, ["init", "-q", "--bare", "-b", "main", remote]);
+
+    const developer = join(workspace, "developer");
+    run(workspace, binDirectory, "git", ["clone", "-q", remote, developer]);
+    writeFileSync(join(developer, "README.md"), "app\n");
+    run(developer, binDirectory, "git", ["add", "."]);
+    run(developer, binDirectory, "git", ["commit", "-q", "-m", "init"]);
+    run(developer, binDirectory, "git", ["push", "-q", "origin", "main"]);
+
+    const initOutput = run(developer, binDirectory, "codeprov", ["init"]);
+    assert.match(initOutput, /added +Claude Code capture hooks/);
+    assert.match(initOutput, /added +git pre-push hook/);
+    assert.match(run(developer, binDirectory, "codeprov", ["init"]), /ok +Claude Code capture hooks/, "a second init changes nothing");
+
+    run(developer, binDirectory, "git", ["checkout", "-q", "-b", "feature"]);
+    const file = "src/pricing.js";
+    const content =
+      "export function priceWithTax(amount, rate) {\n" +
+      "  if (rate < 0) {\n" +
+      "    throw new Error('negative rate');\n" +
+      "  }\n" +
+      "  return amount * (1 + rate);\n" +
+      "}\n";
+    mkdirSync(join(developer, "src"));
+    writeFileSync(join(developer, file), content);
+    const payload = {
+      hook_event_name: "PostToolUse",
+      tool_name: "Write",
+      cwd: developer,
+      session_id: "session-1",
+      tool_input: { file_path: join(developer, file), content },
+      tool_response: { success: true },
+    };
+    run(developer, binDirectory, "codeprov", ["capture"], JSON.stringify(payload));
+    writeFileSync(join(developer, ".ai-provenance", "blobs", "unrelated-secret"), "SECRET=1\n");
+    writeFileSync(join(developer, ".env"), "SECRET=1\n");
+    const secretPayload = { ...payload, tool_input: { file_path: join(developer, ".env"), content: "SECRET=1\n" } };
+    writeFileSync(join(developer, ".gitignore"), readFileSync(join(developer, ".gitignore"), "utf8") + ".env\n");
+    run(developer, binDirectory, "codeprov", ["capture"], JSON.stringify(secretPayload));
+
+    run(developer, binDirectory, "git", ["add", "-A"]);
+    run(developer, binDirectory, "git", ["commit", "-q", "-m", "add pricing"]);
+    run(developer, binDirectory, "git", ["push", "-q", "origin", "feature"]);
+
+    const remoteRefs = git(remote, ["for-each-ref", "--format=%(refname)", LEDGER_REF_PREFIX]);
+    assert.equal(remoteRefs.trim().split("\n").length, 1, "the plain git push also shared this clone's ledger");
+    const sharedRef = remoteRefs.trim();
+    const sharedLedger = git(remote, ["cat-file", "blob", `${sharedRef}:ledger.jsonl`]);
+    assert.match(sharedLedger, /src\/pricing\.js/);
+    assert.doesNotMatch(sharedLedger, /\.env/, "edits to ignored files are never shared");
+    const sharedSnapshots = git(remote, ["ls-tree", "--name-only", `${sharedRef}:blobs`]);
+    assert.doesNotMatch(sharedSnapshots, /unrelated-secret/, "only snapshots referenced by shared events are pushed");
+
+    const pushAgain = run(developer, binDirectory, "codeprov", ["sync"]);
+    assert.match(pushAgain, /already shared/);
+
+    const ci = join(workspace, "ci");
+    run(workspace, binDirectory, "git", ["clone", "-q", "--branch", "feature", remote, ci]);
+    assert.equal(existsSync(join(ci, ".ai-provenance")), false, "CI has no local ledger");
+    const throwLine = content.split("\n").findIndex((line) => line.includes("throw")) + 1;
+    const returnLine = content.split("\n").findIndex((line) => line.includes("return amount")) + 1;
+    writeFileSync(join(workspace, "lcov.info"), `SF:${join(ci, file)}\nDA:2,3\nDA:${throwLine},0\nDA:${returnLine},3\nend_of_record\n`);
+
+    const checkOutput = run(ci, binDirectory, "codeprov", [
+      "check",
+      "--base",
+      "origin/main",
+      "--coverage",
+      join(workspace, "lcov.info"),
+      "--fetch",
+      "origin",
+    ]);
+    assert.match(checkOutput, /^1 AI-authored line not covered by tests/);
+    assert.match(checkOutput, new RegExp(`src/pricing\\.js:${throwLine} `));
+    assert.equal(loadProvenance(ci).sharedLedgerCount, 1);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("installClaudeHooks merges into existing settings and is idempotent", () => {
+  const repo = mkdtempSync(join(tmpdir(), "codeprov-init-"));
+  try {
+    mkdirSync(join(repo, ".claude"));
+    const existing = {
+      permissions: { allow: ["Bash(npm test)"] },
+      hooks: { PostToolUse: [{ matcher: "Write", hooks: [{ type: "command", command: "prettier --write" }] }] },
+    };
+    writeFileSync(join(repo, ".claude", "settings.json"), JSON.stringify(existing));
+    assert.equal(installClaudeHooks(repo), "added");
+    assert.equal(installClaudeHooks(repo), "already-present");
+    const settings = JSON.parse(readFileSync(join(repo, ".claude", "settings.json"), "utf8"));
+    assert.deepEqual(settings.permissions, existing.permissions);
+    assert.equal(settings.hooks.PostToolUse.length, 2, "the existing prettier hook is kept");
+    assert.equal(settings.hooks.PostToolUse[1].hooks[0].command, CAPTURE_COMMAND);
+    assert.equal(settings.hooks.PreToolUse[0].matcher, "Bash");
+
+    assert.equal(removeClaudeHooks(repo), true);
+    const restored = JSON.parse(readFileSync(join(repo, ".claude", "settings.json"), "utf8"));
+    assert.deepEqual(restored, existing, "uninstall restores the original settings exactly");
+
+    writeFileSync(join(repo, ".claude", "settings.json"), "{ not json");
+    assert.throws(() => installClaudeHooks(repo), /left untouched/);
+    assert.equal(readFileSync(join(repo, ".claude", "settings.json"), "utf8"), "{ not json");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("insertHookBlock runs codeprov before the existing hook body, so an early exit cannot skip it", () => {
+  const existing = "#!/bin/bash\nnpm run lint\nexit 0\n";
+  const updated = insertHookBlock(existing);
+  const lines = updated.split("\n");
+  assert.equal(lines[0], "#!/bin/bash");
+  assert.equal(lines[1], HOOK_BLOCK_START);
+  assert.ok(updated.includes("npm run lint\nexit 0"));
+  assert.match(insertHookBlock(null), /^#!\/bin\/sh\n# >>> codeprov >>>/);
+  assert.equal(removeHookBlock(updated), existing, "uninstall leaves the original hook byte for byte");
+  assert.equal(removeHookBlock(insertHookBlock(null)), null, "a hook that only held codeprov is deleted");
+});
+
+test("prePushHookPath follows core.hooksPath and husky", () => {
+  const repo = mkdtempSync(join(tmpdir(), "codeprov-hooks-"));
+  try {
+    git(repo, ["init", "-q"]);
+    assert.equal(prePushHookPath(repo), join(repo, ".git", "hooks", "pre-push"));
+    git(repo, ["config", "core.hooksPath", ".husky/_"]);
+    assert.equal(prePushHookPath(repo), join(repo, ".husky", "pre-push"));
+    git(repo, ["config", "core.hooksPath", "tools/githooks"]);
+    assert.equal(prePushHookPath(repo), join(repo, "tools", "githooks", "pre-push"));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("ensureGitignored appends once", () => {
+  const repo = mkdtempSync(join(tmpdir(), "codeprov-ignore-"));
+  try {
+    writeFileSync(join(repo, ".gitignore"), "node_modules/");
+    assert.equal(ensureGitignored(repo), "added");
+    assert.equal(ensureGitignored(repo), "already-present");
+    assert.equal(readFileSync(join(repo, ".gitignore"), "utf8"), "node_modules/\n.ai-provenance/\n");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("GitHub Actions output escapes workflow commands", () => {
+  const payload: CheckRunPayload = {
+    name: "codeprov",
+    head_sha: "abc",
+    status: "completed",
+    conclusion: "neutral",
+    output: {
+      title: "1 AI-authored line not covered by tests",
+      summary: "summary",
+      annotations: [
+        {
+          path: "src/a,b.ts",
+          start_line: 3,
+          end_line: 4,
+          annotation_level: "warning",
+          title: "Untested AI-authored code in a high-risk area (payments)",
+          message: "2 lines at 100%\nCapture event: e1",
+        },
+      ],
+    },
+  };
+  assert.deepEqual(workflowAnnotationCommands(payload), [
+    "::warning file=src/a%2Cb.ts,line=3,endLine=4,title=Untested AI-authored code in a high-risk area (payments)::2 lines at 100%25%0ACapture event: e1",
+  ]);
+  assert.match(stepSummaryMarkdown(payload), /\| `src\/a,b\.ts:3-4` \| high \|/);
+});
