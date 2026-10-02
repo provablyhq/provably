@@ -133,7 +133,7 @@ function uncoveredFindings(
   riskContext: FileRiskContext,
 ): UncoveredAiFinding[] {
   const lineTexts = headContent.split("\n");
-  const executableHits = withoutTypeOnlyLines(file, headContent, lineHits);
+  const executableHits = executableLineHits(file, headContent, lineHits);
   const uncoveredLines = [...aiAddedLines.keys()].filter((lineNumber) => executableHits.get(lineNumber) === 0).sort((left, right) => left - right);
 
   const groups: number[][] = [];
@@ -161,11 +161,14 @@ function uncoveredFindings(
   }));
 }
 
-function withoutTypeOnlyLines(file: string, content: string, lineHits: LineHits): LineHits {
-  if (!isTypeScriptFile(file)) return lineHits;
-  const typeOnly = typeOnlyLines(content);
-  if (typeOnly.size === 0) return lineHits;
-  return new Map([...lineHits].filter(([lineNumber]) => !typeOnly.has(lineNumber)));
+const PUNCTUATION_ONLY_LINE = /^[\s{}()[\];,]*$/;
+
+function executableLineHits(file: string, content: string, lineHits: LineHits): LineHits {
+  const lineTexts = content.split("\n");
+  const typeOnly = isTypeScriptFile(file) ? typeOnlyLines(content) : new Set<number>();
+  return new Map(
+    [...lineHits].filter(([lineNumber]) => !typeOnly.has(lineNumber) && !PUNCTUATION_ONLY_LINE.test(lineTexts[lineNumber - 1] ?? "")),
+  );
 }
 
 function onlyNonExecutableBetween(previousLine: number, nextLine: number, lineHits: LineHits): boolean {

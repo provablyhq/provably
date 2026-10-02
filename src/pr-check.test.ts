@@ -169,6 +169,58 @@ test("analyzePullRequest flags only AI-authored added lines that tests never exe
   }
 });
 
+test("closing brackets the coverage tool marks as unrun are never reported on their own", () => {
+  const dir = initRepo();
+  try {
+    const file = "src/duration.js";
+    commitFile(dir, file, "export const unit = 'ms';\n", "human: base");
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    const aiFunction =
+      "export function formatDuration(milliseconds) {\n" +
+      "  if (milliseconds < 0) {\n" +
+      "    throw new RangeError('negative');\n" +
+      "  }\n" +
+      "  return `${milliseconds}ms`;\n" +
+      "}\n" +
+      "export function onEachTick(callback) {\n" +
+      "  setInterval(() => {\n" +
+      "    callback();\n" +
+      "  });\n" +
+      "}\n";
+    const headContent = "export const unit = 'ms';\n" + aiFunction;
+    commitFile(dir, file, headContent, "feature: duration");
+    const aiStart = headContent.indexOf(aiFunction);
+    const event: LedgerEvent = {
+      v: 1,
+      id: "event-duration",
+      ts: "2026-10-02T00:00:00.000Z",
+      tool: "claude-code",
+      model: null,
+      file,
+      contentSha256: hashContent(headContent),
+      aiRanges: [[aiStart, aiStart + aiFunction.length]],
+    };
+    const throwLine = lineOf(headContent, "throw new RangeError");
+    const callbackLine = lineOf(headContent, "callback();");
+    const hits = new Map<number, number>(headContent.split("\n").map((_, index) => [index + 1, 1]));
+    for (const lineNumber of [throwLine, throwLine + 1, callbackLine, callbackLine + 1]) hits.set(lineNumber, 0);
+    const lcov = `SF:${file}\n${[...hits].map(([lineNumber, count]) => `DA:${lineNumber},${count}`).join("\n")}\nend_of_record\n`;
+
+    const result = analyzePullRequest({ repoDir: dir, baseRev: "main", headRev: "HEAD", events: [event], coverage: parseCoverage(lcov) });
+
+    assert.deepEqual(
+      result.findings.map((finding) => [finding.startLine, finding.endLine]),
+      [
+        [throwLine, throwLine],
+        [callbackLine, callbackLine],
+      ],
+    );
+    assert.equal(result.files[0]!.uncoveredAiLineCount, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("analyzePullRequest ignores AI lines that were already on the base branch", () => {
   const dir = initRepo();
   try {
